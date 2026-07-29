@@ -6,6 +6,15 @@ import torch.utils.data
 import torch_musa
 from contextlib import nullcontext
 
+# MATE must register its MUSA DLPack bridge before Transformer Engine imports
+# its TVM-FFI dependencies. Importing this helper is safe when the feature is
+# disabled; the optional ``mate`` package is loaded only for the opt-in path.
+from .mate_grouped_gemm import env_flag as _mate_env_flag
+from .mate_grouped_gemm import load_mate_gemm as _load_mate_gemm
+
+if _mate_env_flag("MATE_GROUPED_GEMM", "0"):
+    _load_mate_gemm()
+
 def patch_before_import_megatron():
     # Import fused_layer_norm before transformer_engine
     from . import fused_layer_norm
@@ -232,4 +241,7 @@ if os.getenv("ENABLE_ZERO_BUBBLE", "0") == "1":
 
 patch_before_import_megatron()
 
+if _mate_env_flag("MATE_GROUPED_GEMM", "0"):
+    from .mate_grouped_gemm import install_mate_grouped_gemm
 
+    install_mate_grouped_gemm()

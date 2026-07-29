@@ -96,6 +96,34 @@ export PROFILE_STEP_END=6         # 可选,Megatron --profile-step-end,默认 6
 
 回退开关在 `cluster/dist_train_caizhi.sh` 顶部(默认注释),经 `dist_run_megatron.sh` SSH 白名单透传;启动横幅打印 `GROUP_GEMM: 0/1`。
 
+## MATE expert BF16 fast path
+
+在 BF16、无 bias 的 GroupedMLP 上提供可回退的混合实现:
+
+- fprop/dgrad: MATE `ragged_m_moe_gemm_16bit`;
+- wgrad:单次 Transformer Engine `general_grouped_gemm(layout="NT")`;
+- wgrad 直接写 FP32 `main_grad`,不创建 BF16 临时梯度,也不增加后续 BF16→FP32 add/cast。
+
+该路径只局部接管 MoE expert GroupedLinear。ws128 现有的全局
+`--no-gradient-accumulation-fusion` 保持不变,因此不会改变 dense Linear 的反向路径。
+
+启用方式:
+
+```bash
+export MATE_GROUPED_GEMM=1
+export MATE_USE_MAIN_GRAD=1
+```
+
+两个变量经 `cluster/dist_run_megatron.sh` 的 SSH 白名单传到所有节点。设置
+`MATE_GROUPED_GEMM=0` 可完整回退原 Transformer Engine GroupedLinear。
+
+依赖与限制:
+
+- 每个节点必须安装同版本的 `mate` 与 `mate-mubin`;启动脚本会检查并打印版本。
+- 当前仅支持 BF16、连续 MUSA tensor、无 bias、非 FP8、DeepEP/GroupedMLP 路径;不满足条件时会打印一次 fallback 并走原 TE 实现。
+- 当前生产配置未开启 overlap-grad-reduce。后续若开启该功能,需要先补充 direct-main-grad 的梯度 ready 验证。
+- MATE 使用 `backend="mubin"`;不要只安装 `mate` 后让 128 节点在首次 kernel 时并发下载产物。
+
 关键路径(pod 内):
 
 - 训练输出/ckpt:`/home/jd/wangkang/llm_pretrain/outputs/${LOG_NAME}`
