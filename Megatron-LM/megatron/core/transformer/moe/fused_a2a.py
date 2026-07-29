@@ -134,21 +134,14 @@ class FusedDispatch(torch.autograd.Function):
         ctx.async_finish = async_finish
         ctx.allocate_on_comm_stream = allocate_on_comm_stream
         if os.getenv("MATE_GROUPED_GEMM", "0") == "1":
-            host_tokens_per_expert = torch.tensor(
+            tokens_per_expert = torch.tensor(
                 num_recv_tokens_per_expert_list,
                 dtype=torch.int32,
-                pin_memory=True,
-            )
-            tokens_per_expert = host_tokens_per_expert.to(
                 device=x.device,
-                non_blocking=True,
             )
             # Keep DeepEP's host split sizes for TE wgrad. The device tensor is
             # consumed by MATE fprop/dgrad, so no Tensor.tolist() sync is needed.
             tokens_per_expert._mate_m_splits = tuple(num_recv_tokens_per_expert_list)
-            # Keep the pinned source alive until the async H2D and all consumers
-            # of the device counts have completed.
-            tokens_per_expert._mate_host_counts = host_tokens_per_expert
         else:
             tokens_per_expert = torch.tensor(num_recv_tokens_per_expert_list)
 
