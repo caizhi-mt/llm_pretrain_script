@@ -15,9 +15,11 @@ export LOG_NAME=ws128_$(date +%Y%m%d)   # 每次新 run 换名，避免 cache/ck
 # GroupGEMM（对齐 examples 各模型脚本 --moe-grouped-gemm；musa_pretrain_ws128.sh 默认已开）
 # export MOE_GROUPED_GEMM=0        # 置 0 去掉 --moe-grouped-gemm，回退 SequentialMLP（仅排查问题用）
 
-# BF16 expert fast path（需要所有节点预装同版本 mate 与 mate-mubin）
-# export MATE_GROUPED_GEMM=1       # fprop/dgrad=MATE，wgrad=TE grouped GEMM
-# export MATE_USE_MAIN_GRAD=1      # wgrad 直写 FP32 main_grad，避免 BF16 临时梯度和 add
+# BF16 expert fast path（默认开启；需要所有节点预装同版本 mate 与 mate-mubin）
+# export MATE_GROUPED_GEMM=0       # 置 0 回退 Transformer Engine GroupedLinear
+# export MATE_USE_MAIN_GRAD=0      # 置 0 禁用 wgrad 直写 FP32 main_grad
+# export MATE_CACHE_MUBIN_DISPATCH=0  # 置 0 禁用 MUBIN 元数据缓存
+# export MATE_DEFER_DEEPEP_COUNTS=0   # 置 0 回退 DeepEP counts 同步构造路径
 
 bash auto_fault_manager.sh \
   --hostfile ../hostfile.runtime.128 \

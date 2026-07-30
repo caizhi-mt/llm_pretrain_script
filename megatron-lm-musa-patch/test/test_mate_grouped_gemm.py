@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -38,3 +39,36 @@ def test_is_packed_checks_physical_weight_adjacency():
 
     unpacked = [torch.empty((4, 8), dtype=torch.bfloat16) for _ in range(3)]
     assert not MODULE._is_packed(unpacked)
+
+
+def test_mubin_dispatch_cache_reuses_metadata_but_not_custom_repository(tmp_path):
+    calls = {"dispatcher": 0, "kernel": 0}
+
+    def dispatcher(path):
+        calls["dispatcher"] += 1
+        return object()
+
+    def ensure_kernel(module, module_dir, kernel_name, repository=None):
+        calls["kernel"] += 1
+        return Path(module_dir) / f"{kernel_name}.mu"
+
+    gemm_api = SimpleNamespace(MoeGemmMubinDispatcher=dispatcher)
+    dispatch = SimpleNamespace(ensure_mubin_kernel_artifact=ensure_kernel)
+    assert MODULE._install_mubin_dispatch_cache(gemm_api, dispatch)
+    assert not MODULE._install_mubin_dispatch_cache(gemm_api, dispatch)
+
+    first = gemm_api.MoeGemmMubinDispatcher(tmp_path / "kernel_map.json")
+    second = gemm_api.MoeGemmMubinDispatcher(str(tmp_path / "kernel_map.json"))
+    assert first is second
+    assert calls["dispatcher"] == 1
+
+    for _ in range(2):
+        dispatch.ensure_mubin_kernel_artifact("gemm", tmp_path, "kernel_a")
+    assert calls["kernel"] == 1
+
+    repository = object()
+    for _ in range(2):
+        dispatch.ensure_mubin_kernel_artifact(
+            "gemm", tmp_path, "kernel_a", repository=repository
+        )
+    assert calls["kernel"] == 3

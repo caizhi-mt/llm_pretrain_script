@@ -246,10 +246,12 @@ fi
 # BF16 MoE expert fast path:
 #   fprop/dgrad: MATE ragged-M GroupGEMM
 #   wgrad:       one Transformer Engine grouped GEMM call, directly into FP32 main_grad
-# It is opt-in because every node must have matching mate and mate-mubin packages.
-export MATE_GROUPED_GEMM=${MATE_GROUPED_GEMM:-0}
+# Enabled by default; every node must have matching mate and mate-mubin packages.
+export MATE_GROUPED_GEMM=${MATE_GROUPED_GEMM:-1}
 export MATE_USE_MAIN_GRAD=${MATE_USE_MAIN_GRAD:-1}
-for flag_name in MATE_GROUPED_GEMM MATE_USE_MAIN_GRAD; do
+export MATE_CACHE_MUBIN_DISPATCH=${MATE_CACHE_MUBIN_DISPATCH:-1}
+export MATE_DEFER_DEEPEP_COUNTS=${MATE_DEFER_DEEPEP_COUNTS:-1}
+for flag_name in MATE_GROUPED_GEMM MATE_USE_MAIN_GRAD MATE_CACHE_MUBIN_DISPATCH MATE_DEFER_DEEPEP_COUNTS; do
     flag_value=${!flag_name}
     if [[ "${flag_value}" != "0" && "${flag_value}" != "1" ]]; then
         echo "Error: ${flag_name} must be 0 or 1, got '${flag_value}'" >&2

@@ -838,7 +838,7 @@ class TEGroupedMLP(MegatronModule):
         # wgrad, avoiding a device-to-host synchronization in the expert layer.
         mate_counts = None
         tokens_per_expert_list = None
-        if os.getenv('MATE_GROUPED_GEMM', '0') == '1':
+        if os.getenv('MATE_GROUPED_GEMM', '1') == '1':
             if hasattr(tokens_per_expert, '_mate_m_splits'):
                 tokens_per_expert_list = list(tokens_per_expert._mate_m_splits)
             else:

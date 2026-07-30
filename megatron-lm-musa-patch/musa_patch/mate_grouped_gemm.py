@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import functools
 import os
+from pathlib import Path
 from typing import Sequence
 
 import torch
@@ -30,7 +31,58 @@ def load_mate_gemm():
     import torch_musa  # noqa: F401
     from mate import gemm as mate_gemm
 
+    if env_flag("MATE_CACHE_MUBIN_DISPATCH", "1"):
+        try:
+            from mate.jit.mubin.gemm import dispatch, gemm_api
+
+            if _install_mubin_dispatch_cache(gemm_api, dispatch):
+                _log("MUBIN dispatch cache installed")
+        except (AttributeError, ImportError) as exc:
+            # MATE's private MUBIN API may change between releases. Keep the
+            # grouped GEMM path usable and make the missing optimization clear.
+            _log(f"MUBIN dispatch cache unavailable: {exc}")
+
     return mate_gemm
+
+
+def _install_mubin_dispatch_cache(gemm_api, dispatch) -> bool:
+    """Cache immutable MATE MUBIN metadata, never tensors or routing counts.
+
+    MATE 0.2.5 rebuilds ``MoeGemmMubinDispatcher`` and re-verifies the selected
+    kernel artifact for every ragged-M call. Both results depend only on the
+    installed metadata path/kernel name. Kernel selection still runs for every
+    call, so changed dtype/layout/selection thresholds use a separate entry.
+    """
+    if getattr(gemm_api, "_megatron_mubin_dispatch_cache_installed", False):
+        return False
+
+    original_dispatcher = gemm_api.MoeGemmMubinDispatcher
+    original_ensure_kernel = dispatch.ensure_mubin_kernel_artifact
+
+    @functools.lru_cache(maxsize=None)
+    def _dispatcher_for_path(kernel_map_path: str):
+        return original_dispatcher(Path(kernel_map_path))
+
+    def cached_dispatcher(kernel_map_path):
+        return _dispatcher_for_path(str(Path(kernel_map_path)))
+
+    @functools.lru_cache(maxsize=None)
+    def _verified_kernel(module: str, module_dir: str, kernel_file_name: str):
+        return original_ensure_kernel(module, Path(module_dir), kernel_file_name)
+
+    def cached_ensure_kernel(module, module_dir, kernel_file_name, repository=None):
+        # Custom repositories may be mutable or non-hashable. They are not used
+        # by the packaged mate-mubin path, so preserve original semantics.
+        if repository is not None:
+            return original_ensure_kernel(
+                module, module_dir, kernel_file_name, repository=repository
+            )
+        return _verified_kernel(str(module), str(Path(module_dir)), str(kernel_file_name))
+
+    gemm_api.MoeGemmMubinDispatcher = cached_dispatcher
+    dispatch.ensure_mubin_kernel_artifact = cached_ensure_kernel
+    gemm_api._megatron_mubin_dispatch_cache_installed = True
+    return True
 
 
 def _rank() -> int:
@@ -61,6 +113,12 @@ class _MateGroupedLinear(torch.autograd.Function):
         is_first_microbatch: bool | None,
         *weights: torch.Tensor,
     ):
+        # In ``mate`` affinity mode this binds only the Python thread that
+        # submits MATE work. DeepEP/communication threads were created before
+        # this point and retain their unrestricted affinity.
+        from .cpu_affinity import maybe_bind_local_rank_cpu_affinity
+
+        maybe_bind_local_rank_cpu_affinity("mate")
         mate_gemm = load_mate_gemm()
 
         in_features = weights[0].shape[-1]

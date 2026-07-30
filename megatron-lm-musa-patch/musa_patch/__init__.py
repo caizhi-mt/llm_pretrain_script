@@ -1,5 +1,10 @@
 import os
 import sys
+
+from .cpu_affinity import maybe_bind_local_rank_cpu_affinity
+
+maybe_bind_local_rank_cpu_affinity()
+
 import torch
 import torch.utils
 import torch.utils.data
@@ -12,7 +17,7 @@ from contextlib import nullcontext
 from .mate_grouped_gemm import env_flag as _mate_env_flag
 from .mate_grouped_gemm import load_mate_gemm as _load_mate_gemm
 
-if _mate_env_flag("MATE_GROUPED_GEMM", "0"):
+if _mate_env_flag("MATE_GROUPED_GEMM", "1"):
     _load_mate_gemm()
 
 def patch_before_import_megatron():
@@ -241,7 +246,7 @@ if os.getenv("ENABLE_ZERO_BUBBLE", "0") == "1":
 
 patch_before_import_megatron()
 
-if _mate_env_flag("MATE_GROUPED_GEMM", "0"):
+if _mate_env_flag("MATE_GROUPED_GEMM", "1"):
     from .mate_grouped_gemm import install_mate_grouped_gemm
 
     install_mate_grouped_gemm()
