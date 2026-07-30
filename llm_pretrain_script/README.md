@@ -124,6 +124,27 @@ export MATE_USE_MAIN_GRAD=1
 - 当前生产配置未开启 overlap-grad-reduce。后续若开启该功能,需要先补充 direct-main-grad 的梯度 ready 验证。
 - MATE 使用 `backend="mubin"`;不要只安装 `mate` 后让 128 节点在首次 kernel 时并发下载产物。
 
+## MUSA MLA RoPE fast path
+
+标准 `--rope-type rope`、MLA、BF16 训练默认开启两级 MUSA 优化:
+
+- `MUSA_NATIVE_ROPE=1`:未使用 MLA 布局融合时,Q/K RoPE 走 MUDNN `torch.rope`,替代 eager `cos/sin/mul/cat` 组合算子。
+- `MUSA_FUSED_MLA_ROPE=1`:一次完成 Q RoPE 以及 KV split、K RoPE/broadcast 和 Q/K/V 连续布局,去掉 attention 前的 Q/K `cat` 与 V `contiguous`。MUSA dQ 使用 16-head tile;CUDA 保持原 tile。
+
+当前融合布局仅对标准 RoPE、MUSA BF16/FP16、CP=1、非 packed sequence、非 inference 生效,且 QK/位置/V head dim 必须为 2 的幂;其他配置安全回退原路径。两个变量均由 `cluster/dist_run_megatron.sh` 透传,并由 `musa_pretrain_ws128.sh` 校验为 `0/1`。
+
+回退方式:
+
+```bash
+# 只关闭 MLA Q/K/V 布局融合,保留 MUDNN torch.rope
+export MUSA_FUSED_MLA_ROPE=0
+
+# 完整回退 eager 标准 RoPE;同时不会启用 MLA 布局融合
+export MUSA_NATIVE_ROPE=0
+```
+
+单机 8×S5000、EP8、1 层 MoE、seq=4096、MBS=2、BF16、fake data 的 8-rank trace 中,Profiler step 中位数由 541.895 ms 降至 538.808 ms(-0.57%),GPU active union 均值减少 3.46 ms。4-step loss 最大绝对差为 `1.3e-4`,无 NaN/skipped iteration。该数据只用于验证单机算子和短程 loss;128 机生产拓扑仍需独立 A/B。
+
 关键路径(pod 内):
 
 - 训练输出/ckpt:`/home/jd/wangkang/llm_pretrain/outputs/${LOG_NAME}`

@@ -1,7 +1,9 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 
+import logging
 import math
+import os
 from dataclasses import dataclass
 from typing import NoReturn, Optional, Union
 
@@ -38,6 +40,8 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import deprecate_inference_params, is_te_min_version
 
+logger = logging.getLogger(__name__)
+
 try:
     from megatron.core.fusions.fused_mla_yarn_rope_apply import (
         fused_apply_mla_rope_for_kv,
@@ -46,6 +50,51 @@ try:
 except:
     fused_apply_mla_rope_for_kv = None
     fused_apply_mla_rope_for_q = None
+
+
+def _env_flag(name: str, default: str) -> bool:
+    """Read a strict boolean environment flag."""
+
+    value = os.getenv(name, default).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean flag, got {value!r}")
+
+
+def _is_power_of_two(value: int) -> bool:
+    return value > 0 and (value & (value - 1)) == 0
+
+
+def _can_use_musa_fused_mla_rope(
+    config: MLATransformerConfig,
+    hidden_states: torch.Tensor,
+    packed_seq: bool,
+    inference_context,
+) -> bool:
+    """Check whether the MUSA MLA RoPE/layout fusion supports this invocation."""
+
+    if not _env_flag("MUSA_NATIVE_ROPE", "1") or not _env_flag(
+        "MUSA_FUSED_MLA_ROPE", "1"
+    ):
+        return False
+    if fused_apply_mla_rope_for_q is None or fused_apply_mla_rope_for_kv is None:
+        return False
+    if getattr(config, "rope_type", None) != "rope":
+        return False
+    if packed_seq or inference_context is not None or config.context_parallel_size != 1:
+        return False
+    if config.rotary_interleaved or hidden_states.dtype not in {torch.float16, torch.bfloat16}:
+        return False
+    if not bool(getattr(hidden_states, "is_musa", False)):
+        return False
+
+    # The Triton kernels use compile-time arange bounds for these dimensions.
+    return all(
+        _is_power_of_two(dim)
+        for dim in (config.qk_head_dim, config.qk_pos_emb_head_dim, config.v_head_dim)
+    )
 
 
 try:
@@ -491,8 +540,21 @@ class MLASelfAttention(MultiLatentAttention):
         rotary_pos_cos = None
         rotary_pos_sin = None
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+        apply_mla_rope_fusion = self.config.apply_rope_fusion
         if self.config.rope_type == "rope":
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
+            if _can_use_musa_fused_mla_rope(
+                self.config, hidden_states, packed_seq, inference_context
+            ):
+                # Reuse the MLA fusion kernels to apply standard RoPE while assembling
+                # contiguous Q/K/V. This removes the explicit Q/K cats and V copy.
+                rotary_pos_cos = torch.cos(rotary_pos_emb).to(dtype=hidden_states.dtype)
+                rotary_pos_sin = torch.sin(rotary_pos_emb).to(dtype=hidden_states.dtype)
+                rotary_pos_emb = None
+                apply_mla_rope_fusion = True
+                if not getattr(self, "_printed_musa_fused_mla_rope", False):
+                    logger.info("Using fused MUSA standard RoPE and MLA Q/K/V layout assembly")
+                    self._printed_musa_fused_mla_rope = True
         else:
             if self.config.apply_rope_fusion:
                 rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
@@ -687,7 +749,7 @@ class MLASelfAttention(MultiLatentAttention):
             k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
 
             # todo add assert about fusions and caching
-            if self.config.apply_rope_fusion:
+            if apply_mla_rope_fusion:
                 cp_rank = self.model_comm_pgs.cp.rank()
                 cp_size = self.model_comm_pgs.cp.size()
                 query = fused_apply_mla_rope_for_q(
