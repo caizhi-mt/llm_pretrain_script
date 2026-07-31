@@ -109,12 +109,13 @@ export NO_LOSS_REDUCE=${NO_LOSS_REDUCE:-1}                             # 原 cud
 # 代码路径（对齐 cuda_pretrain.sh：固定 MCORE_PATH + pretrain_gpt.py，禁止 env 覆盖）
 # cuda:  MCORE_PATH=/mnt/workspace/jdcloud/Megatron-LM
 #        torchrun ... ${MCORE_PATH}/pretrain_gpt.py
-# musa:  同路径语义固定为容器内 /home/Megatron-LM/pretrain_gpt.py；
+# musa:  默认使用当前仓库内的 Megatron-LM 和 megatron-lm-musa-patch；
 #        仍经 LAUNCHER 先注入 musa_patch（MUSA 必需），再 runpy 到该入口。
 # ---------------------------------------------------------------------------
-MCORE_PATH=/home/Megatron-LM
-PATCH_HOME=/home/megatron-lm-musa-patch
-LAUNCHER=${SCRIPT_DIR}/pretrain_gpt_musa_launcher.py
+REPO_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
+MCORE_PATH=${MCORE_PATH:-${REPO_ROOT}/Megatron-LM}
+PATCH_HOME=${PATCH_HOME:-${REPO_ROOT}/megatron-lm-musa-patch}
+LAUNCHER=${SCRIPT_DIR}/pretrain_gpt_musa_routerfusion_launcher.py
 PRETRAIN_SCRIPT=${MCORE_PATH}/pretrain_gpt.py
 export MCORE_PATH
 export PRETRAIN_SCRIPT
@@ -231,6 +232,7 @@ ADD_NETWORK_SIZE_ARGS=(
     --cross-entropy-loss-fusion
     --cross-entropy-fusion-impl native
     --moe-permute-fusion
+    --moe-router-fusion
     --moe-router-force-load-balancing
 )
 # GroupGEMM（对齐 examples 各模型脚本的使能方式，即 --moe-grouped-gemm 参数）:
@@ -241,6 +243,64 @@ if [ "${MOE_GROUPED_GEMM}" = "1" ]; then
     ADD_NETWORK_SIZE_ARGS+=(
         --moe-grouped-gemm
     )
+fi
+
+# BF16 MoE expert fast path:
+#   fprop/dgrad: MATE ragged-M GroupGEMM
+#   wgrad:       one Transformer Engine grouped GEMM call, directly into FP32 main_grad
+# It is opt-in because every node must have matching mate and mate-mubin packages.
+export MATE_GROUPED_GEMM=${MATE_GROUPED_GEMM:-0}
+export MATE_USE_MAIN_GRAD=${MATE_USE_MAIN_GRAD:-1}
+export MATE_CACHE_MUBIN_DISPATCH=${MATE_CACHE_MUBIN_DISPATCH:-1}
+export MATE_DEFER_DEEPEP_COUNTS=${MATE_DEFER_DEEPEP_COUNTS:-1}
+export MUSA_CPU_AFFINITY=${MUSA_CPU_AFFINITY:-0}
+export MUSA_CPU_AFFINITY_MODE=${MUSA_CPU_AFFINITY_MODE:-mate}
+export MUSA_CPU_AFFINITY_MAP=${MUSA_CPU_AFFINITY_MAP:-}
+export TE_TN_GM6_WGRAD=${TE_TN_GM6_WGRAD:-0}
+export MATE_TN_GM6_WGRAD=${MATE_TN_GM6_WGRAD:-0}
+for flag_name in MATE_GROUPED_GEMM MATE_USE_MAIN_GRAD MATE_CACHE_MUBIN_DISPATCH MATE_DEFER_DEEPEP_COUNTS MUSA_CPU_AFFINITY TE_TN_GM6_WGRAD MATE_TN_GM6_WGRAD; do
+    flag_value=${!flag_name}
+    if [[ "${flag_value}" != "0" && "${flag_value}" != "1" ]]; then
+        echo "Error: ${flag_name} must be 0 or 1, got '${flag_value}'" >&2
+        exit 2
+    fi
+done
+if [[ "${MATE_GROUPED_GEMM}" = "1" && "${MOE_GROUPED_GEMM}" != "1" ]]; then
+    echo "Error: MATE_GROUPED_GEMM=1 requires MOE_GROUPED_GEMM=1" >&2
+    exit 2
+fi
+if [[ "${TE_TN_GM6_WGRAD}" = "1" && "${MOE_GROUPED_GEMM}" != "1" ]]; then
+    echo "Error: TE_TN_GM6_WGRAD=1 requires MOE_GROUPED_GEMM=1" >&2
+    exit 2
+fi
+if [[ "${MATE_TN_GM6_WGRAD}" = "1" && ( "${MATE_GROUPED_GEMM}" != "1" || "${MATE_USE_MAIN_GRAD}" != "1" ) ]]; then
+    echo "Error: MATE_TN_GM6_WGRAD=1 requires MATE_GROUPED_GEMM=1 and MATE_USE_MAIN_GRAD=1" >&2
+    exit 2
+fi
+if [[ "${MATE_GROUPED_GEMM}" = "1" ]]; then
+    python - <<'PY'
+from importlib.metadata import PackageNotFoundError, version
+
+packages = ("mate", "mate-mubin")
+versions = {}
+for package in packages:
+    try:
+        versions[package] = version(package)
+    except PackageNotFoundError as exc:
+        raise SystemExit(
+            f"MATE_GROUPED_GEMM=1 requires {package!r} on every node"
+        ) from exc
+if versions["mate"] != versions["mate-mubin"]:
+    raise SystemExit(
+        "mate and mate-mubin versions must match: "
+        f"{versions['mate']} != {versions['mate-mubin']}"
+    )
+print(
+    "MATE expert fast path packages: "
+    f"mate={versions['mate']} mate-mubin={versions['mate-mubin']}",
+    flush=True,
+)
+PY
 fi
 # MoE dispatcher（对齐 telechat3/105B run_pretrain_telechatv3_105B_musa.sh）:
 # USE_DEEPEP_ACE=1 → flex + deepep + ACE（musa_patch deepep_ace，fused_a2a Buffer use_ace=True）
@@ -267,7 +327,7 @@ if [ "${ENABLE_SEQUENCE_PARALLEL}" = "1" ] && [ "${TP}" -gt 1 ]; then
 fi
 # 未启用（见 docs/musa_cuda_adaptation_issues.md）:
 #   --pipeline-model-parallel-layout / overlap / delay-wgrad /
-#   --moe-router-fusion / --moe-shared-expert-compute-before-router
+#   --moe-shared-expert-compute-before-router
 # flex+deepep+ACE / --enable-experimental 已随 USE_DEEPEP_ACE=1 接入（见上方 dispatcher 分支）
 
 if [ "${NNODES}" -lt 128 ]; then
@@ -472,6 +532,9 @@ echo "  TRAIN_ITERS: ${TRAINING_STEPS}"
 echo "  PROFILER   : ${ENABLE_PROFILER:-0}"
 echo "  DEEPEP_ACE : ${USE_DEEPEP_ACE}"
 echo "  GROUP_GEMM : ${MOE_GROUPED_GEMM}"
+echo "  MATE_FD_TE_W: ${MATE_GROUPED_GEMM} (main_grad=${MATE_USE_MAIN_GRAD}, cache=${MATE_CACHE_MUBIN_DISPATCH}, defer_counts=${MATE_DEFER_DEEPEP_COUNTS})"
+echo "  CPU_AFFINITY: ${MUSA_CPU_AFFINITY} (mode=${MUSA_CPU_AFFINITY_MODE})"
+echo "  TN_GM6_WGRAD: te=${TE_TN_GM6_WGRAD} mate=${MATE_TN_GM6_WGRAD}"
 echo "  RUN_NAME   : ${RUN_NAME}"
 echo "  LOG        : ${LOG_OUTPUT}/output_rank${NODE_RANK}.log"
 echo "========================================"

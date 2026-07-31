@@ -9,7 +9,7 @@ import torch
 import torch.distributed
 from megatron.core import mpu
 
-from megatron.core.transformer.moe.moe_utils import track_moe_metrics
+from megatron.core.transformer.moe.moe_utils import clear_aux_losses_tracker, track_moe_metrics
 from megatron.training.global_vars import (
     get_args,
     get_timers,
@@ -490,8 +490,11 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
                 iteration,
             )
     if args.num_experts is not None:
-        moe_loss_scale = 1 / get_num_microbatches()
-        track_moe_metrics(moe_loss_scale, iteration, writer, wandb_writer, total_loss_dict, args.moe_per_layer_logging, moe_layer_freq=args.moe_layer_freq)
+        if int(os.getenv("SWEEP_SKIP_MOE_METRICS", "0")):
+            clear_aux_losses_tracker()
+        else:
+            moe_loss_scale = 1 / get_num_microbatches()
+            track_moe_metrics(moe_loss_scale, iteration, writer, wandb_writer, total_loss_dict, args.moe_per_layer_logging, moe_layer_freq=args.moe_layer_freq)
 
     if iteration % args.log_interval == 0:
         # HACK(huang.huang): support memory analysis dump

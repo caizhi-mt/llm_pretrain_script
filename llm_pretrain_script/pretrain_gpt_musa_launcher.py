@@ -4,6 +4,7 @@
 import os
 import runpy
 import sys
+from pathlib import Path
 
 if os.getenv("ACCELERATOR_BACKEND", "musa") == "musa":
     import musa_patch  # noqa: F401 — 必须最先导入，不可提前 import megatron
@@ -49,7 +50,8 @@ if os.getenv("ACCELERATOR_BACKEND", "musa") == "musa":
 
     musa_training.training_log = _training_log_core_compat
 
-mcore_path = os.environ.get("MCORE_PATH", "/home/Megatron-LM")
+repo_root = Path(__file__).resolve().parent.parent
+mcore_path = os.environ.get("MCORE_PATH", str(repo_root / "Megatron-LM"))
 pretrain_script = os.environ.get(
     "PRETRAIN_SCRIPT",
     os.path.join(mcore_path, "pretrain_gpt.py"),

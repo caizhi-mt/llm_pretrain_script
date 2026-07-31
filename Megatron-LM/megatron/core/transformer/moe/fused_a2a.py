@@ -133,7 +133,25 @@ class FusedDispatch(torch.autograd.Function):
         ctx.handle = handle
         ctx.async_finish = async_finish
         ctx.allocate_on_comm_stream = allocate_on_comm_stream
-        tokens_per_expert = torch.tensor(num_recv_tokens_per_expert_list)
+        if os.getenv("MATE_GROUPED_GEMM", "0") == "1":
+            host_splits = tuple(num_recv_tokens_per_expert_list)
+            if os.getenv("MATE_DEFER_DEEPEP_COUNTS", "1") == "1":
+                # DeepEP already returns these split sizes as host metadata.
+                # Keep them on CPU until the routing map is available instead
+                # of synchronizing the dispatch stream with an immediate H2D.
+                tokens_per_expert = torch.tensor(host_splits, dtype=torch.int32)
+                tokens_per_expert._mate_deferred_device_counts = True
+            else:
+                tokens_per_expert = torch.tensor(
+                    host_splits,
+                    dtype=torch.int32,
+                    device=x.device,
+                )
+            # Keep DeepEP's host split sizes for TE wgrad. The device tensor is
+            # consumed by MATE fprop/dgrad, so no Tensor.tolist() sync is needed.
+            tokens_per_expert._mate_m_splits = host_splits
+        else:
+            tokens_per_expert = torch.tensor(num_recv_tokens_per_expert_list)
 
         return (recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, num_tokens_per_rank, handle)
 

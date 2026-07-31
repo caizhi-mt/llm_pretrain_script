@@ -1,10 +1,38 @@
 import os
 import sys
+
+from .cpu_affinity import maybe_bind_local_rank_cpu_affinity
+
+maybe_bind_local_rank_cpu_affinity()
+
 import torch
 import torch.utils
 import torch.utils.data
 import torch_musa
 from contextlib import nullcontext
+
+# MATE must register its MUSA DLPack bridge before Transformer Engine imports
+# its TVM-FFI dependencies. Importing this helper is safe when the feature is
+# disabled; the optional ``mate`` package is loaded only for the opt-in path.
+from .mate_grouped_gemm import env_flag as _mate_env_flag
+from .mate_grouped_gemm import load_mate_gemm as _load_mate_gemm
+
+if _mate_env_flag("MATE_GROUPED_GEMM", "0"):
+    _load_mate_gemm()
+
+# GM6 and Transformer Engine expose overlapping ASM dispatcher symbols.  The
+# standalone GM6 operator must be resident first; loading it lazily from the
+# first wgrad call makes its kernel resolve against TE's dispatcher instead.
+# Both entry points need the same preload: MATE_TN_GM6_WGRAD calls the operator
+# directly and would otherwise import it only after TE is already resident.
+_tn_gm6_requested = any(
+    os.getenv(name, "0") == "1"
+    for name in ("TE_TN_GM6_WGRAD", "MATE_TN_GM6_WGRAD")
+)
+if _tn_gm6_requested:
+    from .tn_gm6 import preload_tn_gm6
+
+    preload_tn_gm6()
 
 def patch_before_import_megatron():
     # Import fused_layer_norm before transformer_engine
@@ -232,4 +260,12 @@ if os.getenv("ENABLE_ZERO_BUBBLE", "0") == "1":
 
 patch_before_import_megatron()
 
+if _mate_env_flag("MATE_GROUPED_GEMM", "0"):
+    from .mate_grouped_gemm import install_mate_grouped_gemm
 
+    install_mate_grouped_gemm()
+
+if os.getenv("TE_TN_GM6_WGRAD", "0") == "1":
+    from .te_tn_gm6 import install_te_tn_gm6
+
+    install_te_tn_gm6()

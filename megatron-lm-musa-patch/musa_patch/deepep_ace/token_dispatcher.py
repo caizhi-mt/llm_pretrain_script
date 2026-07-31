@@ -43,9 +43,23 @@ def _DeepepManager_get_permuted_hidden_states_by_experts(self, hidden_states: to
     ace_hidden_states, ace_probs = deepep_buffer.get_ace_combine_buffer(
         hidden_states.size(0), hidden_states.size(1), self.router_topk, True)
 
+    host_splits = getattr(self.tokens_per_expert, "_mate_m_splits", None)
     self.dispatched_routing_map, self.dispatched_probs = fused_indices_to_multihot(
-        self.dispatched_indices, self.dispatched_probs, self.num_local_experts, preallocated_probs_b=ace_probs
+        self.dispatched_indices,
+        self.dispatched_probs,
+        self.num_local_experts,
+        preallocated_probs_b=ace_probs,
     )
+
+    if getattr(self.tokens_per_expert, "_mate_deferred_device_counts", False):
+        # Derive device counts from the routing map after independent work has
+        # been submitted. Chunking avoids the inaccurate large-column bool
+        # reduction observed on the current MUSA backend.
+        count_chunks = self.dispatched_routing_map.split(8192, dim=0)
+        partial_counts = [chunk.sum(dim=0, dtype=torch.int32) for chunk in count_chunks]
+        device_counts = torch.stack(partial_counts, dim=0).sum(dim=0, dtype=torch.int32)
+        device_counts._mate_m_splits = host_splits
+        self.tokens_per_expert = device_counts
 
     # if self.config.moe_router_padding_for_fp8:
     #     self.dispatched_routing_map, self.tokens_per_expert = self._pad_routing_map(
@@ -59,7 +73,9 @@ def _DeepepManager_get_permuted_hidden_states_by_experts(self, hidden_states: to
         hidden_states,
         self.dispatched_probs,
         self.dispatched_routing_map,
-        num_out_tokens=self.tokens_per_expert.sum().item(),
+        num_out_tokens=(
+            sum(host_splits) if host_splits is not None else self.tokens_per_expert.sum().item()
+        ),
         preallocated_act_b=ace_hidden_states,
     )
 

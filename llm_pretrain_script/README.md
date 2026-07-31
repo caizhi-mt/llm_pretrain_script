@@ -85,7 +85,10 @@ export PROFILE_STEP_END=6         # 可选,Megatron --profile-step-end,默认 6
 - `USE_DEEPEP_ACE=1`(默认):`--moe-token-dispatcher-type flex --moe-enable-deepep --moe-token-drop-policy probs --enable-experimental`,并默认 `MCCL_CROSS_NIC=1`(对齐参考脚本 flex+deepep 链路)。
 - `USE_DEEPEP_ACE=0`:回退原 `--moe-token-dispatcher-type alltoall` 路径(改动前行为)。回退开关在 `cluster/dist_train_caizhi.sh` 顶部(默认注释),经 `dist_run_megatron.sh` SSH 白名单透传。
 
-注意:参考脚本还开了 `--moe-router-fusion`,本仓库暂未接入(见 `docs/musa_cuda_adaptation_issues.md` 未启用清单);首次切 flex+deepep 建议先小步数验证再进长训。
+`fbccaa6` 已通过 `pretrain_gpt_musa_routerfusion_launcher.py` 接入
+`--moe-router-fusion`。该 launcher 必须先导入 `musa_patch`，再加载 Megatron/TE；
+不要在启用 router fusion 或 GM6 时退回普通 `pretrain_gpt_musa_launcher.py`。
+首次切 flex+deepep 仍建议先用小步数验证再进长训。
 
 ## GroupGEMM
 
@@ -96,9 +99,45 @@ export PROFILE_STEP_END=6         # 可选,Megatron --profile-step-end,默认 6
 
 回退开关在 `cluster/dist_train_caizhi.sh` 顶部(默认注释),经 `dist_run_megatron.sh` SSH 白名单透传;启动横幅打印 `GROUP_GEMM: 0/1`。
 
+## MATE expert BF16 fast path
+
+在 BF16、无 bias 的 GroupedMLP 上提供可回退的混合实现:
+
+- fprop/dgrad: MATE `ragged_m_moe_gemm_16bit`;
+- wgrad:单次 Transformer Engine `general_grouped_gemm(layout="NT")`;
+- wgrad 直接写 FP32 `main_grad`,不创建 BF16 临时梯度,也不增加后续 BF16→FP32 add/cast。
+
+该路径只局部接管 MoE expert GroupedLinear。ws128 现有的全局
+`--no-gradient-accumulation-fusion` 保持不变,因此不会改变 dense Linear 的反向路径。
+
+启用方式:
+
+```bash
+export MATE_GROUPED_GEMM=1
+export MATE_USE_MAIN_GRAD=1
+export MATE_CACHE_MUBIN_DISPATCH=1
+export MATE_DEFER_DEEPEP_COUNTS=1
+```
+
+上述变量经 `cluster/dist_run_megatron.sh` 的 SSH 白名单传到所有节点。设置
+`MATE_GROUPED_GEMM=0` 可完整回退原 Transformer Engine GroupedLinear。
+
+依赖与限制:
+
+- 每个节点必须安装同版本的 `mate` 与 `mate-mubin`;启动脚本会检查并打印版本。
+- 当前仅支持 BF16、连续 MUSA tensor、无 bias、非 FP8、DeepEP/GroupedMLP 路径;不满足条件时会打印一次 fallback 并走原 TE 实现。
+- 当前生产配置未开启 overlap-grad-reduce。后续若开启该功能,需要先补充 direct-main-grad 的梯度 ready 验证。
+- MATE 使用 `backend="mubin"`;不要只安装 `mate` 后让 128 节点在首次 kernel 时并发下载产物。
+- CPU 绑核默认关闭；16 机验证使用 `MUSA_CPU_AFFINITY=1`、
+  `MUSA_CPU_AFFINITY_MODE=mate`。拓扑和 cpuset 配置见
+  `../megatron-lm-musa-patch/docs/mate_cpu_affinity.md`。
+- 可选的 GM6 TN wgrad、导入顺序、ABI 和 16 机复现命令见
+  `../megatron-lm-musa-patch/docs/tn_gm6.md`。
+
 关键路径(pod 内):
 
-- 训练输出/ckpt:`/home/jd/wangkang/llm_pretrain/outputs/${LOG_NAME}`
+- 16 机验证输出/ckpt:`/home/jd/haowen.yan/training_runs/outputs/${LOG_NAME}`
+- 16 机 manager/torchrun 日志:`/home/jd/haowen.yan/training_runs/{manager_logs,torchrun_logs}`
 - 数据:`/home/jd/wangkang/llm_pretrain/data/tkn_ds_the_pile`
-- Megatron 代码:`/home/Megatron-LM`(首次运行自动 `setup.py build_ext --inplace`)
-- MUSA patch:`/home/megatron-lm-musa-patch`
+- Megatron 代码:当前 checkout 的 `Megatron-LM`
+- MUSA patch:当前 checkout 的 `megatron-lm-musa-patch`

@@ -14,6 +14,9 @@ MT-Megatron is a python patch of [Megatron-LM](https://github.com/NVIDIA/Megatro
 
 # Getting started
 
+The optional standalone TE TN GM6 wgrad integration, launch modes, ABI constraints,
+and rollback procedure are documented in [docs/tn_gm6.md](docs/tn_gm6.md).
+
 ## 1. Prepare the code
 
 You can create a directory named `train_dev`, and use the command below to clone the `MT-Megatron-LM`, `MT-TransformerEngine` and `Megatron-LM` to the `train_dev`.  
