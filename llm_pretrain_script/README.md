@@ -131,6 +131,29 @@ artifact，以及按最终 `GemmMubinId` 选择的 kernel path。每一步仍使
 launch；cache 不持有 tensor、data pointer 或专家 token 分布。设为 `0` 可回退
 MATE 原生逐次 dispatch，仅用于 A/B 或故障排查。
 
+## DeepEP local Permute/Unpermute compact fast path
+
+`MUSA_COMPACT_PERMUTE=1` 默认把 DeepEP 返回的 `[tokens, router_topk]` indices/probs
+转换为 compact TE row map，使 local permute/unpermute 的 native MUSA kernel 只扫描
+router top-k 列，不再扫描全部 local-expert 列。每一步都会按当前 routing 重新生成
+映射，不缓存专家选择、counts、tensor 或 data pointer，因此支持动态且非均匀的
+expert token 分布；输入沿用 DeepEP/router top-k 的每 token expert id 唯一约束。
+
+快路径仅用于 DeepEP-ACE 的 MUSA BF16 hidden、FP32 probs、连续 int32/int64 indices，
+且 hidden dim 必须为 8 的倍数、router top-k 必须为 4 的倍数；其他配置自动回退原
+TE dense 路径。需要 A/B 或
+排查时可在所有节点设置：
+
+```bash
+export MUSA_COMPACT_PERMUTE=0
+```
+
+单机 8×S5000、EP8、2 层 MoE、seq4096、MBS2、BF16、full recompute、fake data、
+force-load-balancing 的 8-rank trace 中，四段 local permutation kernel 总和由
+`14.792 ms` 降到 `13.537 ms`（`-8.48%`），全部 GEMM 无结构性回退。两组反向顺序
+30-step A/B 的稳态中位数均改善，分别为 `-3.0 ms` 和 `-2.3 ms`；生产拓扑仍需
+独立复测。
+
 ## MATE MLA FlashAttention forward
 
 DeepSeek MLA 的 BF16 fixed-length attention 默认使用混合实现：

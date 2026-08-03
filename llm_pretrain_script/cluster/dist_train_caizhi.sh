@@ -21,6 +21,7 @@ export LOG_NAME=ws128_$(date +%Y%m%d)   # 每次新 run 换名，避免 cache/ck
 # export MATE_FLASH_ATTN=0         # 置 0 回退原生 MUSA FlashAttention 前向
 # export MATE_CACHE_MUBIN_DISPATCH=0  # 置 0 禁用 GroupGEMM/FA MUBIN 元数据缓存
 # export MATE_DEFER_DEEPEP_COUNTS=0   # 置 0 回退 DeepEP counts 同步构造路径
+# export MUSA_COMPACT_PERMUTE=0        # 置 0 回退 TE dense local-expert permutation
 # export MUSA_NATIVE_ROPE=0            # 置 0 回退标准 RoPE eager 组合算子
 # export MUSA_FUSED_MLA_ROPE=0         # 置 0 仅使用 torch.rope，不融合 MLA Q/K/V 布局
 

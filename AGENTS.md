@@ -22,6 +22,7 @@
 | `MATE_FLASH_ATTN` | `1` | BF16 MLA FA forward 使用 MATE MUBIN，backward 保持原生 MUSA；设为 `0` 完整回退原 TE FA。 |
 | `MATE_CACHE_MUBIN_DISPATCH` | `1` | 缓存 GroupGEMM/FA 不可变 MUBIN module、dispatcher、最终 `GemmMubinId` kernel path 与 launch handle；不缓存 tensor、路由 counts、LSE 或算子输出。 |
 | `MATE_DEFER_DEEPEP_COUNTS` | `1` | 延迟构造 device counts，并从 device routing map 归约得到；设为 `0` 回退 dispatch 后立即构造 device tensor。 |
+| `MUSA_COMPACT_PERMUTE` | `1` | DeepEP local permute/unpermute 使用 `[tokens, router_topk]` compact row map 调用 TE MUSA kernel；设为 `0` 回退 `[tokens, local_experts]` dense TE 路径。 |
 | `MUSA_CPU_AFFINITY` | `0` | 默认不绑核；设为 `1` 后按 `MUSA_CPU_AFFINITY_MODE/MAP` 绑核。推荐 `mode=mate`。 |
 | `MUSA_NATIVE_ROPE` | `1` | 标准 RoPE 使用 MUDNN `torch.rope`；设为 `0` 回退 eager 组合算子，并同时禁用下面的 MLA 布局融合。 |
 | `MUSA_FUSED_MLA_ROPE` | `1` | 标准 MLA RoPE 与 Q/K/V 布局融合；设为 `0` 只保留 MUDNN `torch.rope`。 |
@@ -152,6 +153,39 @@
   MATE 0.2.5 实际 dispatcher 验证不同动态总 `M`、相同 `GemmMubinId` 复用同一
   kernel path。
 
+### 2026-08-03 — DeepEP local Permute/Unpermute compact row map
+
+- 主要文件：
+  - `megatron-lm-musa-patch/musa_patch/compact_permutation.py`
+  - `megatron-lm-musa-patch/musa_patch/deepep_ace/token_dispatcher.py`
+  - `megatron-lm-musa-patch/test/test_compact_permutation.py`
+  - ws128 启动脚本与本文档
+- 实现：DeepEP 已返回 `[N, router_topk]` indices/probs。仍用当前动态 routing 生成
+  TE expert-major row id，但在数据搬运前把 row map 收缩为 `[N, router_topk]` 和
+  `[router_topk, N]`，使 TE native MUSA permute/unpermute 只扫描 top-k 列，而不是
+  32 个 local-expert 列。unpermute backward 保持 TE 原生转置 map kernel。
+- 动态语义：每次 dispatch 都重新生成 row map；不缓存 routing、counts、tensor、
+  data pointer 或专家选择，不假设 counts 均衡。无效 `-1` slot 的 probability grad
+  由 TE kernel 写零。只长期保留一份 compact 转置映射，token-major 映射仅在
+  permute forward 期间存在。沿用 DeepEP/router top-k 的每 token expert id 唯一契约。
+- 默认与回退：`MUSA_COMPACT_PERMUTE=1` 默认启用；仅接管 DeepEP-ACE、MUSA BF16
+  hidden、FP32 compact probs、连续 int32/int64 indices、hidden dim 为 8 的倍数且
+  top-k 为 4 的倍数的路径。
+  其他 dtype、shape、设备或显式设为 `0` 时完整回退原 TE dense 实现。
+- 算子精度：非均匀 expert counts、含无效 slot 的 4096×2048 测试中，permuted
+  hidden/probs、restored hidden、hidden grad 和 compact probs grad 均逐元素一致。
+- Trace：单机 8×S5000、EP8、2 层 MoE、seq4096、MBS2、BF16、full/uniform
+  recompute、fake data、force-load-balancing。四段 local permutation kernel 的
+  8-rank 均值总和 `14.792 → 13.537 ms`，减少 `1.255 ms`（`8.48%`）；其中
+  permute backward `3.064 → 2.068 ms`。全部 GEMM `211.874 → 211.734 ms`，无回退。
+- 训练性能：两组反向顺序 30-step A/B 的稳态中位数，compact 分别快
+  `3.0/2.3 ms`；按每组 MAD 去除系统长尾后的均值合并收益约 `1.76 ms`
+  （`0.25%`）。hidden loss 最大相对差 `0.0175%`，无 NaN/skipped iteration；
+  该小幅收益仍需在生产拓扑复测。
+- 单测：`test_compact_permutation.py` 共 7 项通过，覆盖 raw `uint8` preallocated
+  storage 与 expanded/stride-0 backward grad；其中 MUSA 测试需显式设置
+  `RUN_MUSA_TESTS=1`。
+
 ## 当前已知边界
 
 - 单机 EP8 结果不能直接代表 ws128 的 TP2/PP8/EP64 生产拓扑；进入长训前仍需同配置短程 A/B。
@@ -159,3 +193,4 @@
 - CPU affinity 与 CPU NUMA/SNC/NPS 和容器 cpuset 强相关，必须按 `mate_cpu_affinity.md` 生成映射；错误映射会 fail-fast。
 - MLA RoPE 精度目前验证了算子前后向和 4-step loss，尚未做长程收敛对比。
 - 任何优化都必须同时观察空泡与 GEMM kernel 时间；只缩短 CPU 区间但拖慢 GroupGEMM 的方案不能保留。
+- compact permutation 当前仍通过 dense bool routing map 生成 expert-major row id；若继续优化该段，优先评估直接从 compact indices 构造 row id，但必须保留非均匀 counts、无效 slot 和 probability-gradient 语义。
