@@ -46,22 +46,75 @@ def load_mate_gemm():
 
 
 def _install_mubin_dispatch_cache(gemm_api, dispatch) -> bool:
-    """Cache immutable MATE MUBIN metadata, never tensors or routing counts.
+    """Cache immutable MATE MUBIN dispatch state, never tensors or routing counts.
 
     MATE 0.2.5 rebuilds ``MoeGemmMubinDispatcher`` and re-verifies the selected
-    kernel artifact for every ragged-M call. Both results depend only on the
-    installed metadata path/kernel name. Kernel selection still runs for every
-    call, so changed dtype/layout/selection thresholds use a separate entry.
+    kernel artifact for every ragged-M call. It also recomputes the MUBIN id
+    hash and resolves the same module directory and kernel path on every call.
+
+    The selected ``GemmMubinId`` is immutable and already contains every field
+    that changes the kernel variant, including dtype, layout, MP architecture,
+    and the block selected from the current ragged-M shape. Cache by that id,
+    while continuing to pass the current M and routing counts to every launch.
     """
     if getattr(gemm_api, "_megatron_mubin_dispatch_cache_installed", False):
         return False
 
     original_dispatcher = gemm_api.MoeGemmMubinDispatcher
     original_ensure_kernel = dispatch.ensure_mubin_kernel_artifact
+    original_ensure_module = getattr(gemm_api, "ensure_mubin_module_artifacts", None)
+
+    if callable(original_ensure_module):
+
+        @functools.lru_cache(maxsize=None)
+        def _default_module_dir(module: str):
+            return original_ensure_module(module)
+
+        def cached_ensure_module(module, cache_dir=None, repository=None):
+            # The packaged training path always uses the immutable default
+            # artifact location. Preserve MATE's behavior for explicit or
+            # potentially mutable repositories.
+            if cache_dir is not None or repository is not None:
+                return original_ensure_module(
+                    module, cache_dir=cache_dir, repository=repository
+                )
+            return _default_module_dir(str(module))
+
+        gemm_api.ensure_mubin_module_artifacts = cached_ensure_module
 
     @functools.lru_cache(maxsize=None)
     def _dispatcher_for_path(kernel_map_path: str):
-        return original_dispatcher(Path(kernel_map_path))
+        dispatcher_instance = original_dispatcher(Path(kernel_map_path))
+        original_resolve_kernel_path = getattr(
+            dispatcher_instance, "resolve_kernel_path", None
+        )
+        if not callable(original_resolve_kernel_path):
+            return dispatcher_instance
+
+        @functools.lru_cache(maxsize=None)
+        def _resolved_kernel_path(asm_id, mubin_dir: str):
+            # MATE's resolver only uses ``args`` through ``get_asm_id(args)``.
+            # Supplying the already-computed immutable id keeps its lookup,
+            # validation, and error behavior intact on a cache miss.
+            return original_resolve_kernel_path(
+                None,
+                lambda _unused_args: asm_id,
+                Path(mubin_dir),
+            )
+
+        def cached_resolve_kernel_path(args, get_asm_id, mubin_dir):
+            asm_id = get_asm_id(args)
+            try:
+                hash(asm_id)
+            except TypeError:
+                # Keep compatibility with a future MATE version that returns
+                # a mutable dispatch id.
+                return original_resolve_kernel_path(args, get_asm_id, mubin_dir)
+            return _resolved_kernel_path(asm_id, str(Path(mubin_dir)))
+
+        dispatcher_instance.resolve_kernel_path = cached_resolve_kernel_path
+        dispatcher_instance._megatron_resolution_cache_installed = True
+        return dispatcher_instance
 
     def cached_dispatcher(kernel_map_path):
         return _dispatcher_for_path(str(Path(kernel_map_path)))
@@ -259,6 +312,42 @@ def _is_packed(weights: Sequence[torch.Tensor]) -> bool:
     )
 
 
+def _static_layout_supported(module, device: torch.device, use_main_grad: bool) -> bool:
+    """Cache parameter/layout checks that are invariant during training.
+
+    Only successful checks are cached. This lets a module created before DDP
+    retry after ``main_grad`` and packed parameter storage have been installed.
+    The cache stores booleans and device metadata, never parameters or grads.
+    """
+    cache_key = (bool(use_main_grad), device.type, device.index)
+    cache = getattr(module, "_mate_static_support_cache", None)
+    if cache is not None and cache.get(cache_key, False):
+        return True
+
+    weights = [getattr(module, f"weight{i}") for i in range(module.num_gemms)]
+    supported = _is_packed(weights) and all(
+        weight.dtype == torch.bfloat16 and weight.device == device for weight in weights
+    )
+
+    if supported and use_main_grad:
+        main_grads = [getattr(weight, "main_grad", None) for weight in weights]
+        supported = all(
+            isinstance(grad, torch.Tensor)
+            and grad.dtype == torch.float32
+            and grad.device == device
+            and grad.shape == weight.shape
+            and grad.is_contiguous()
+            for weight, grad in zip(weights, main_grads)
+        )
+
+    if supported:
+        if cache is None:
+            cache = {}
+            module._mate_static_support_cache = cache
+        cache[cache_key] = True
+    return supported
+
+
 def _pack_weights_before_ddp(module) -> None:
     """Pack expert Parameters before Megatron DDP remaps parameter storage."""
     weights = [getattr(module, f"weight{i}") for i in range(module.num_gemms)]
@@ -314,24 +403,7 @@ def _supported(
     ):
         return False
 
-    weights = [getattr(module, f"weight{i}") for i in range(module.num_gemms)]
-    if (
-        not _is_packed(weights)
-        or any(weight.dtype != torch.bfloat16 or weight.device != inp.device for weight in weights)
-    ):
-        return False
-
-    if use_main_grad:
-        main_grads = [getattr(weight, "main_grad", None) for weight in weights]
-        return all(
-            isinstance(grad, torch.Tensor)
-            and grad.dtype == torch.float32
-            and grad.device == inp.device
-            and grad.shape == weight.shape
-            and grad.is_contiguous()
-            for weight, grad in zip(weights, main_grads)
-        )
-    return True
+    return _static_layout_supported(module, inp.device, use_main_grad)
 
 
 def _host_splits(m_splits):

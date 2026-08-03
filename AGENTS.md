@@ -20,7 +20,7 @@
 | `MATE_GROUPED_GEMM` | `1` | MoE expert fprop/dgrad 使用 MATE，wgrad 使用 TE；设为 `0` 完整回退 TE GroupedLinear。 |
 | `MATE_USE_MAIN_GRAD` | `1` | TE wgrad 直写 FP32 `main_grad`；设为 `0` 返回临时 weight grad。 |
 | `MATE_FLASH_ATTN` | `1` | BF16 MLA FA forward 使用 MATE MUBIN，backward 保持原生 MUSA；设为 `0` 完整回退原 TE FA。 |
-| `MATE_CACHE_MUBIN_DISPATCH` | `1` | 缓存 GroupGEMM/FA 不可变 MUBIN dispatcher、artifact 选择与 launch handle；不缓存 tensor、路由 counts、LSE 或算子输出。 |
+| `MATE_CACHE_MUBIN_DISPATCH` | `1` | 缓存 GroupGEMM/FA 不可变 MUBIN module、dispatcher、最终 `GemmMubinId` kernel path 与 launch handle；不缓存 tensor、路由 counts、LSE 或算子输出。 |
 | `MATE_DEFER_DEEPEP_COUNTS` | `1` | 延迟构造 device counts，并从 device routing map 归约得到；设为 `0` 回退 dispatch 后立即构造 device tensor。 |
 | `MUSA_CPU_AFFINITY` | `0` | 默认不绑核；设为 `1` 后按 `MUSA_CPU_AFFINITY_MODE/MAP` 绑核。推荐 `mode=mate`。 |
 | `MUSA_NATIVE_ROPE` | `1` | 标准 RoPE 使用 MUDNN `torch.rope`；设为 `0` 回退 eager 组合算子，并同时禁用下面的 MLA 布局融合。 |
@@ -121,6 +121,36 @@
   FA forward kernel 累计 `18.566 → 17.102 ms`（`-7.89%`），全部
   `rotary_fwd_kv → MATE FA` device gap 小于 `0.003 ms`；四次 forward 加两次
   native backward 的 kernel 总时长 `41.740 → 39.813 ms`（`-1.927 ms`）。
+
+### 2026-08-03 — 完善 MATE GroupGEMM MUBIN 调度缓存
+
+- 主要文件：
+  - `megatron-lm-musa-patch/musa_patch/mate_grouped_gemm.py`
+  - `megatron-lm-musa-patch/test/test_mate_grouped_gemm.py`
+  - `llm_pretrain_script/README.md`
+- 实现：在既有 dispatcher 和 artifact verification cache 之上，增加默认 MUBIN
+  module 路径缓存，并按最终不可变 `GemmMubinId` 缓存 kernel path。动态 `M` 仍先
+  参与 block/ASM id 选择；当前 input、output、weights、routing counts 和实际 launch
+  scalar 每次重新传入，不缓存任何 tensor 或 data pointer。
+- GroupedLinear 检查：按 module、device 和 `use_main_grad` 缓存首次成功的静态
+  packed weight/main-grad layout 检查；input/counts 的 dtype、device、contiguous、
+  split 数量和当前总 token 数仍逐次校验。DDP 尚未安装 `main_grad` 时的失败结果不缓存。
+- 默认与回退：沿用 `MATE_CACHE_MUBIN_DISPATCH=1`，没有新增环境变量；设为 `0`
+  回退 MATE 原生逐次 dispatch。显式 cache dir 或 custom repository 保持原 MATE 语义。
+- Trace 验证：单机 8×S5000、EP8、2 层、seq4096、MBS2、BF16、full/uniform
+  recompute、fake data、force-load-balancing、无 DeepEP recompute cache。四处
+  `permute→FC1` 空泡的每 rank 均值总和 `0.759 → 0.0116 ms`，最大值
+  `2.874 → 0.0044 ms`；fprop/dgrad CPU dispatch 分别减少 `58.5%/57.3%`。
+- GEMM 验证：MATE fprop+dgrad GPU kernel 总时长 `91.285 → 91.142 ms`
+  （`-0.16%`）；TE wgrad `37.064 → 37.185 ms`（`+0.33%`）；全部 GEMM
+  `211.725 → 211.874 ms`（`+0.07%`），均在运行波动内，没有结构性回退。
+- 训练验证：同环境 30-step cache off/on 稳态均值 `713.592/713.776 ms`，统计持平；
+  hidden loss 最大相对差 `0.0061%`，无 NaN/skipped iteration，max allocated 均为
+  `64,029 MB`。完整 cache 下原生/MATE MLA 稳态均值 `716.004/713.776 ms`，当前
+  两层测试中 MATE MLA 快 `2.228 ms`（`0.31%`）；该数字不可直接线性外推到生产拓扑。
+- 单测：`test_mate_grouped_gemm.py` 与 `test_cpu_affinity.py` 共 10 项通过；另以
+  MATE 0.2.5 实际 dispatcher 验证不同动态总 `M`、相同 `GemmMubinId` 复用同一
+  kernel path。
 
 ## 当前已知边界
 

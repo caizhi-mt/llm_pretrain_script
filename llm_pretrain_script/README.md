@@ -125,6 +125,12 @@ export MATE_FLASH_ATTN=1
 - 当前生产配置未开启 overlap-grad-reduce。后续若开启该功能,需要先补充 direct-main-grad 的梯度 ready 验证。
 - MATE 使用 `backend="mubin"`;不要只安装 `mate` 后让 128 节点在首次 kernel 时并发下载产物。
 
+`MATE_CACHE_MUBIN_DISPATCH=1` 默认缓存不可变的 MUBIN module/dispatcher、已校验
+artifact，以及按最终 `GemmMubinId` 选择的 kernel path。每一步仍使用当前动态
+`M` 和 routing counts 选择 ASM id，并把当前 input/weight/output/counts 直接传给
+launch；cache 不持有 tensor、data pointer 或专家 token 分布。设为 `0` 可回退
+MATE 原生逐次 dispatch，仅用于 A/B 或故障排查。
+
 ## MATE MLA FlashAttention forward
 
 DeepSeek MLA 的 BF16 fixed-length attention 默认使用混合实现：
