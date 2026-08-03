@@ -889,14 +889,6 @@ class TEGroupedMLP(MegatronModule):
             permuted_local_hidden_states, grouped_gemm_splits,
             fine_grained_offload=self.config.offload_moe_fc1_input,
         )
-        capture_after_fc1 = getattr(
-            tokens_per_expert, "_deepep_recompute_cache_capture_after_fc1", None
-        )
-        if capture_after_fc1 is not None:
-            try:
-                capture_after_fc1()
-            finally:
-                delattr(tokens_per_expert, "_deepep_recompute_cache_capture_after_fc1")
 
         def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
             if self.config.bias_activation_fusion:

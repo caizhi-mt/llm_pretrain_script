@@ -873,29 +873,27 @@ def get_moe_layer_wise_logging_tracker():
 
 class RandomSTE(torch.autograd.Function):
     """
-    Straight-Through Estimator(STE) function that returns random values from
-    Megatron's checkpoint-aware expert-parallel RNG stream.
+    Straight-Through Estimator(STE) function that returns random values
+    with different seed for each rank.
 
     This is used to generate random logits of router for load-balanced benchmark.
     """
+
+    generator = None
 
     @staticmethod
     def forward(ctx, logits):
         """
         Forward pass returns random logits with rank-specific seed.
         """
-        # Use Megatron's expert-parallel RNG stream. Activation checkpointing
-        # already snapshots/restores this tracker, so the original no-grad
-        # forward and its grad-enabled recompute produce identical routes.
-        from megatron.core.tensor_parallel.random import (
-            get_cuda_rng_tracker,
-            get_expert_parallel_rng_tracker_name,
-        )
+        if RandomSTE.generator is None:
+            global_rank = torch.distributed.get_rank()
+            base_seed = 42
+            seed = base_seed + global_rank
+            RandomSTE.generator = torch.Generator(device=logits.device)
+            RandomSTE.generator.manual_seed(seed)
 
-        tracker = get_cuda_rng_tracker()
-        tracker_name = get_expert_parallel_rng_tracker_name()
-        with tracker.fork(tracker_name):
-            random_logits = logits.clone().normal_()
+        random_logits = logits.clone().normal_(generator=RandomSTE.generator)
         return random_logits
 
     @staticmethod
