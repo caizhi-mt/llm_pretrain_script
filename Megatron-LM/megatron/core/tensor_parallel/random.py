@@ -4,6 +4,8 @@
 # repo: https://github.com/pytorch/pytorch
 
 import contextlib
+import contextvars
+import itertools
 import logging
 from typing import Optional, Union
 
@@ -36,6 +38,28 @@ except ModuleNotFoundError:
 _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
 _EXPERT_PARALLEL_RNG_TRACKER_NAME = 'expert-parallel-rng'
 _DATA_PARALLEL_RNG_TRACKER_NAME = 'data-parallel-rng'
+
+
+# The DeepEP recompute cache needs to distinguish a checkpoint's original
+# no-grad forward from unrelated no-grad execution such as evaluation.  Keep
+# this marker local to the current Python context so nested checkpoints and
+# autograd worker threads restore their previous phase correctly.
+_CHECKPOINT_PHASE = contextvars.ContextVar('megatron_checkpoint_phase', default=None)
+_CHECKPOINT_ID_COUNTER = itertools.count()
+
+
+def get_checkpoint_phase():
+    """Return ``(phase, checkpoint_id)`` while executing a checkpoint body."""
+    return _CHECKPOINT_PHASE.get()
+
+
+@contextlib.contextmanager
+def _checkpoint_phase(phase, checkpoint_id):
+    token = _CHECKPOINT_PHASE.set((phase, checkpoint_id))
+    try:
+        yield
+    finally:
+        _CHECKPOINT_PHASE.reset(token)
 
 
 def _get_cuda_rng_state(
@@ -422,7 +446,8 @@ class CheckpointFunction(torch.autograd.Function):
         # Copy the rng states.
         ctx.rng_states = _get_all_rng_states()
 
-        with torch.no_grad():
+        ctx.checkpoint_id = next(_CHECKPOINT_ID_COUNTER)
+        with torch.no_grad(), _checkpoint_phase('forward', ctx.checkpoint_id):
             outputs = run_function(*args)
 
         # Divide hidden states across model parallel group and only keep
@@ -459,7 +484,7 @@ class CheckpointFunction(torch.autograd.Function):
 
             # Compute the forward pass.
             detached_inputs = detach_variable(inputs)
-            with torch.enable_grad():
+            with torch.enable_grad(), _checkpoint_phase('recompute', ctx.checkpoint_id):
                 outputs = ctx.run_function(*detached_inputs)
 
         if isinstance(outputs, torch.Tensor):
@@ -499,7 +524,8 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
             ctx.fp8_recipe = None
             fwd_ctx = contextlib.nullcontext()
 
-        with torch.no_grad(), fwd_ctx:
+        ctx.checkpoint_id = next(_CHECKPOINT_ID_COUNTER)
+        with torch.no_grad(), fwd_ctx, _checkpoint_phase('forward', ctx.checkpoint_id):
             outputs = run_function(*args)
         ctx.save_for_backward(*detach_variable(args))
         # the CheckpointWithoutOutput object is passed in, then it can access the saved input
@@ -573,7 +599,12 @@ class CheckpointWithoutOutput(object):
                 recompute_ctx = contextlib.nullcontext()
                 fp8_ctx = contextlib.nullcontext()
 
-            with torch.enable_grad(), fp8_ctx, recompute_ctx:
+            with (
+                torch.enable_grad(),
+                fp8_ctx,
+                recompute_ctx,
+                _checkpoint_phase('recompute', self.ctx.checkpoint_id),
+            ):
                 outputs = self.run_function(*self.ctx.saved_tensors)
 
         self.run_function = None
@@ -634,7 +665,8 @@ class OffloadFirstInputAndCheckpointWithoutOutputFunction(torch.autograd.Functio
             ctx.fp8 = False
             ctx.fp8_recipe = None
             fwd_ctx = contextlib.nullcontext()
-        with torch.no_grad(), fwd_ctx:
+        ctx.checkpoint_id = next(_CHECKPOINT_ID_COUNTER)
+        with torch.no_grad(), fwd_ctx, _checkpoint_phase('forward', ctx.checkpoint_id):
             outputs = run_function(input_to_offload, *remaining_inputs)
         ctx.save_for_backward(*detach_variable(remaining_inputs))
         input_to_offload_requires_grad = input_to_offload.requires_grad
@@ -692,7 +724,12 @@ class OffloadFirstInputAndCheckpointWithoutOutput(CheckpointWithoutOutput):
                 fp8_ctx = contextlib.nullcontext()
             set_offloading_param(self.ctx.input_to_offload, 'fine_grained_offloading', 'offload')
 
-            with torch.enable_grad(), fp8_ctx, recompute_ctx:
+            with (
+                torch.enable_grad(),
+                fp8_ctx,
+                recompute_ctx,
+                _checkpoint_phase('recompute', self.ctx.checkpoint_id),
+            ):
                 outputs = self.run_function(self.ctx.input_to_offload, *self.ctx.saved_tensors)
 
         self.run_function = None

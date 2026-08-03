@@ -21,6 +21,10 @@
 | `MATE_USE_MAIN_GRAD` | `1` | TE wgrad 直写 FP32 `main_grad`；设为 `0` 返回临时 weight grad。 |
 | `MATE_CACHE_MUBIN_DISPATCH` | `1` | 缓存不可变 MUBIN dispatcher/artifact 校验元数据；不缓存 tensor、路由 counts 或 kernel selection。 |
 | `MATE_DEFER_DEEPEP_COUNTS` | `1` | 延迟构造 device counts，并从 device routing map 归约得到；设为 `0` 回退 dispatch 后立即构造 device tensor。 |
+| `DEEPEP_CACHE_RECOMPUTE_DISPATCH` | `1` | BF16 DeepEP-ACE activation recompute 默认复用原 forward 的 dispatch handle；设为 `0` 完整回退每次重新计算 layout/dispatch metadata。无重计算、非 ACE 或 FP8 时不生效。 |
+| `DEEPEP_CACHE_CAPTURE_AFTER_FC1` | `1` | TE GroupedMLP 默认在 FC1 GroupGEMM 下发后，将 cache capture clone 排到同一计算流，避免独立 stream 与 matmul 争抢带宽；设为 `0` 回退原独立 cache stream。legacy/非 TE grouped GEMM 自动使用原路径。 |
+| `DEEPEP_CACHE_RECOMPUTE_VALIDATE` | `0` | 设为 `1` 时逐次校验 source indices/probs，并通过 EP all-reduce 统一 fallback；仅用于精度调试，不能用于性能测试。 |
+| `DEEPEP_CACHE_RECOMPUTE_MAX_ENTRIES` | `256` | 每层允许的最大在途 checkpoint cache entry 数；超限 fail-fast，防止异常或未执行 backward 时无限占用显存。 |
 | `MUSA_CPU_AFFINITY` | `0` | 默认不绑核；设为 `1` 后按 `MUSA_CPU_AFFINITY_MODE/MAP` 绑核。推荐 `mode=mate`。 |
 | `MUSA_NATIVE_ROPE` | `1` | 标准 RoPE 使用 MUDNN `torch.rope`；设为 `0` 回退 eager 组合算子，并同时禁用下面的 MLA 布局融合。 |
 | `MUSA_FUSED_MLA_ROPE` | `1` | 标准 MLA RoPE 与 Q/K/V 布局融合；设为 `0` 只保留 MUDNN `torch.rope`。 |
@@ -90,10 +94,27 @@
 - 新增本文件，把当前 PR 的功能、历史实验、回退原因、开关和验证集中交给后续 agent。
 - 本项不改变训练运行时行为。
 
+### 2026-08-03 — DeepEP activation-recompute handle cache 与 post-FC1 capture
+
+- 主要文件：
+  - `Megatron-LM/megatron/core/tensor_parallel/random.py`
+  - `Megatron-LM/megatron/core/transformer/moe/moe_utils.py`
+  - `megatron-lm-musa-patch/musa_patch/deepep_ace/token_dispatcher.py`
+- 生命周期：Megatron checkpoint body 暴露唯一 `checkpoint_id` 和 `forward/recompute` phase。每个 `_DeepepManager` 按 checkpoint ID 保存记录，避免 PP warmup、多 microbatch 和反序 backward 错配；eval/no-grad 不会捕获。
+- 缓存内容：ACE handle、received indices/probs、最终 device `tokens_per_expert`、rank counts 及 shape/dtype 元数据。不缓存 hidden、permuted hidden、expert output 或 combine output。TE GroupedMLP 默认在 FC1 GroupGEMM 下发后于同一计算流 clone；其他 expert 路径回退独立 MUSA stream。
+- 梯度：重计算 forward 用 `Buffer.dispatch(x, handle=...)` 返回新 hidden 和原 forward 的 received prob 数值；custom autograd backward 只执行一次 `Buffer.combine(..., topk_weights=grad_probs)`，把概率梯度送回本次重算的 router probs，不增加概率 A2A。
+- 强制均衡：`RandomSTE` 改用 Megatron expert-parallel RNG tracker，使 checkpoint 原 forward/recompute 的随机路由完全一致；旧的独立 generator 不受 checkpoint RNG 恢复管理。
+- 默认与回退：BF16、DeepEP-ACE、full recompute 或 selective MoE recompute 时默认启用；`DEEPEP_CACHE_RECOMPUTE_DISPATCH=0` 完整回退。FP8 暂不启用。结构 key 不一致 fail-fast；debug route mismatch 在所有 EP rank 统一走 full dispatch。
+- 精度验证：单机 EP8、两层 MoE、seq4096、MBS2、BF16、full/uniform recompute、fake data、force-load-balancing。cache off/on 的 4-step aux loss 与总 grad norm 一致；第二层 router grad 完全一致，第一层 router grad norm 相对差约 `2.1e-6`。
+- 性能验证：同配置、fused Router、NUMA 绑核的非 profiler 10-step（统计 step 3–10）均值为 cache-off `741.700 ms`、独立 cache stream `742.325 ms`、post-FC1 默认流 `741.100 ms`。post-FC1 相比独立流快 `1.225 ms/step`，相比 cache-off 快 `0.600 ms/step`；差异仍小于单次运行波动。8-rank trace 中两层 INT64 clone 累计均值从 `1.567 ms/rank` 降到 `0.056 ms/rank`，所有 clone 均位于 stream 0 且顺序为 `FC1 → clone → activation/FC2`。
+- 显存：当前 shape 单 entry 为 `19,900,352` bytes（约 `18.98 MiB`），主要是 ACE row map 和 received indices/probs；总增量取决于每层同时在途的 checkpoint/microbatch 数，生产 PP16 上线前必须实测 warmup 峰值。
+
 ## 当前已知边界
 
 - 单机 EP8 结果不能直接代表 ws128 的 TP2/PP8/EP64 生产拓扑；进入长训前仍需同配置短程 A/B。
 - 当前 MATE main-grad 路径基于生产配置未开启 overlap-grad-reduce；若未来开启，需要重新验证梯度 ready 语义。
+- DeepEP recompute cache 的单机收益目前与 metadata 快照开销基本相抵；其价值依赖生产 PP/EP 调度中的 CPU layout 空泡，不能按 microbenchmark 的 `0.47 ms/层` 直接外推。
+- DeepEP recompute cache 当前仅覆盖 BF16 DeepEP-ACE；FP8/TE checkpoint 和异常跳过 backward 的长期生命周期仍需单独验证。
 - CPU affinity 与 CPU NUMA/SNC/NPS 和容器 cpuset 强相关，必须按 `mate_cpu_affinity.md` 生成映射；错误映射会 fail-fast。
 - MLA RoPE 精度目前验证了算子前后向和 4-step loss，尚未做长程收敛对比。
 - 任何优化都必须同时观察空泡与 GEMM kernel 时间；只缩短 CPU 区间但拖慢 GroupGEMM 的方案不能保留。
