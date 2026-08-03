@@ -112,6 +112,7 @@ export PROFILE_STEP_END=6         # 可选,Megatron --profile-step-end,默认 6
 ```bash
 export MATE_GROUPED_GEMM=1
 export MATE_USE_MAIN_GRAD=1
+export MATE_FLASH_ATTN=1
 ```
 
 两个变量经 `cluster/dist_run_megatron.sh` 的 SSH 白名单传到所有节点。设置
@@ -123,6 +124,31 @@ export MATE_USE_MAIN_GRAD=1
 - 当前仅支持 BF16、连续 MUSA tensor、无 bias、非 FP8、DeepEP/GroupedMLP 路径;不满足条件时会打印一次 fallback 并走原 TE 实现。
 - 当前生产配置未开启 overlap-grad-reduce。后续若开启该功能,需要先补充 direct-main-grad 的梯度 ready 验证。
 - MATE 使用 `backend="mubin"`;不要只安装 `mate` 后让 128 节点在首次 kernel 时并发下载产物。
+
+## MATE MLA FlashAttention forward
+
+DeepSeek MLA 的 BF16 fixed-length attention 默认使用混合实现：
+
+- forward：MATE 0.2.5 MUBIN FlashAttention；
+- backward：保留原生 MUSA `aten::_scaled_dot_product_attention_flash_musa_backward`；
+- dispatch cache：复用 `MATE_CACHE_MUBIN_DISPATCH=1`，缓存不可变的 MUBIN
+  artifact 选择和 launch handle，不缓存 Q/K/V、LSE 或 attention 输出。
+
+快路径只接管 `Dqk=192/Dv=128`、causal、dropout=0、无 ALiBi/softcap、
+CP=1、`USE_RECOMPUTE_VARIANCE=0` 的 MUSA BF16 BSHD 输入；其他配置完整回退
+原 Transformer Engine FlashAttention。当前私有 MUBIN API 固定验证
+`mate=mate-mubin=0.2.5`，版本不匹配时保持原生路径。
+
+```bash
+# 默认开启；完整回退原生 MUSA FlashAttention
+export MATE_FLASH_ATTN=0
+
+# 同时关闭 GroupGEMM/FA 的 MUBIN dispatch cache，仅用于 A/B
+export MATE_CACHE_MUBIN_DISPATCH=0
+```
+
+该实现会保存 MATE forward 的 output/LSE，并在 backward 以 BHSD view 交给原生
+MUSA kernel；不会调用 MATE 0.2.5 自带的 varlen backward。
 
 ## MUSA MLA RoPE fast path
 

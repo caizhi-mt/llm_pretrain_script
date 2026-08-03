@@ -19,7 +19,8 @@
 | `MOE_GROUPED_GEMM` | `1` | 使用 GroupedMLP；设为 `0` 回退 SequentialMLP。 |
 | `MATE_GROUPED_GEMM` | `1` | MoE expert fprop/dgrad 使用 MATE，wgrad 使用 TE；设为 `0` 完整回退 TE GroupedLinear。 |
 | `MATE_USE_MAIN_GRAD` | `1` | TE wgrad 直写 FP32 `main_grad`；设为 `0` 返回临时 weight grad。 |
-| `MATE_CACHE_MUBIN_DISPATCH` | `1` | 缓存不可变 MUBIN dispatcher/artifact 校验元数据；不缓存 tensor、路由 counts 或 kernel selection。 |
+| `MATE_FLASH_ATTN` | `1` | BF16 MLA FA forward 使用 MATE MUBIN，backward 保持原生 MUSA；设为 `0` 完整回退原 TE FA。 |
+| `MATE_CACHE_MUBIN_DISPATCH` | `1` | 缓存 GroupGEMM/FA 不可变 MUBIN dispatcher、artifact 选择与 launch handle；不缓存 tensor、路由 counts、LSE 或算子输出。 |
 | `MATE_DEFER_DEEPEP_COUNTS` | `1` | 延迟构造 device counts，并从 device routing map 归约得到；设为 `0` 回退 dispatch 后立即构造 device tensor。 |
 | `MUSA_CPU_AFFINITY` | `0` | 默认不绑核；设为 `1` 后按 `MUSA_CPU_AFFINITY_MODE/MAP` 绑核。推荐 `mode=mate`。 |
 | `MUSA_NATIVE_ROPE` | `1` | 标准 RoPE 使用 MUDNN `torch.rope`；设为 `0` 回退 eager 组合算子，并同时禁用下面的 MLA 布局融合。 |
@@ -89,6 +90,37 @@
 
 - 新增本文件，把当前 PR 的功能、历史实验、回退原因、开关和验证集中交给后续 agent。
 - 本项不改变训练运行时行为。
+
+### 2026-08-03 — MATE MLA FA forward 与原生 MUSA backward
+
+- 主要文件：
+  - `megatron-lm-musa-patch/musa_patch/mate_flash_attention.py`
+  - `megatron-lm-musa-patch/musa_patch/__init__.py`
+  - ws128 分发/启动脚本、README 和 `test_mate_flash_attention.py`
+- 实现：只替换 TE 模块实际引用的 `flash_attn_func`。BF16 MLA fixed-length forward
+  直接调用缓存后的 MATE MUBIN launch；保存 output/LSE 后，backward 继续调用
+  `aten::_scaled_dot_product_attention_flash_musa_backward`。不调用 MATE 0.2.5
+  自带的 varlen backward。
+- 缓存：复用 `MATE_CACHE_MUBIN_DISPATCH`，key 包含 MATE/artifact 根目录、device、
+  arch、dtype、causal、QK/V head dim；只缓存 immutable launch 元数据。首次选择在
+  profiler warmup 前完成，forward/recompute 均复用同一 launch。
+- 默认与回退：`MATE_FLASH_ATTN=1` 默认启用；仅支持 MP31、BF16、Dqk=192、
+  Dv=128、causal、dropout=0、CP=1、非 recompute-variance 路径。其他 shape/功能走
+  原 TE FA。当前私有 API 固定要求 `mate=mate-mubin=0.2.5`；选中快路径后的
+  runtime/kernel 错误 fail-fast，禁止不同 rank 静默分叉。
+- 算子精度：seq4096、MBS2 下 TP1/128 heads 与 TP2/64 heads 均验证。output 和
+  dQ/dK/dV cosine 不低于 `0.9999928`，max abs 不超过 `0.03125`，无 NaN/Inf。
+- 算子性能：TP1 forward 中位数 `4.808 → 4.432 ms`（`-7.8%`）；TP2/64 heads
+  `2.384 → 2.247 ms`（`-5.7%`）。native backward 耗时保持在测试波动内。
+- 两层训练精度：单机 EP8、seq4096、MBS2、full/uniform recompute、fake data、
+  force-load-balancing、hidden-loss 10 step 全部完成。相对 native 的 hidden loss
+  差异为 `0.116%–0.164%`，未随 step 增长；router seq loss 每 step 完全一致，
+  无 NaN/skipped iteration。max allocated 均为 `64,026 MB`。
+- 两层训练性能：稳定 step 4–10 均值 native `718.77 ms`、MATE `721.87 ms`，
+  差异 `+0.43%`，小于单次 MoE step 波动，不能宣称端到端收益。Trace 中四次
+  FA forward kernel 累计 `18.566 → 17.102 ms`（`-7.89%`），全部
+  `rotary_fwd_kv → MATE FA` device gap 小于 `0.003 ms`；四次 forward 加两次
+  native backward 的 kernel 总时长 `41.740 → 39.813 ms`（`-1.927 ms`）。
 
 ## 当前已知边界
 
