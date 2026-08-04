@@ -23,6 +23,7 @@
 | `MATE_CACHE_MUBIN_DISPATCH` | `1` | 缓存 GroupGEMM/FA 不可变 MUBIN module、dispatcher、最终 `GemmMubinId` kernel path 与 launch handle；不缓存 tensor、路由 counts、LSE 或算子输出。 |
 | `MATE_DEFER_DEEPEP_COUNTS` | `1` | 延迟构造 device counts，并从 device routing map 归约得到；设为 `0` 回退 dispatch 后立即构造 device tensor。 |
 | `MUSA_COMPACT_PERMUTE` | `1` | DeepEP local permute/unpermute 使用 `[tokens, router_topk]` compact row map 调用 TE MUSA kernel；设为 `0` 回退 `[tokens, local_experts]` dense TE 路径。 |
+| `MUSA_FUSED_MLA_DOWN_PROJ` | `1` | TP1、无 bias 的 MLA q/kv down projection 合并 forward/dgrad GEMM，同时保留原 checkpoint 参数和独立 FP32 `main_grad`；设为 `0` 回退两个独立 Linear。 |
 | `MUSA_CPU_AFFINITY` | `0` | 默认不绑核；设为 `1` 后按 `MUSA_CPU_AFFINITY_MODE/MAP` 绑核。推荐 `mode=mate`。 |
 | `MUSA_NATIVE_ROPE` | `1` | 标准 RoPE 使用 MUDNN `torch.rope`；设为 `0` 回退 eager 组合算子，并同时禁用下面的 MLA 布局融合。 |
 | `MUSA_FUSED_MLA_ROPE` | `1` | 标准 MLA RoPE 与 Q/K/V 布局融合；设为 `0` 只保留 MUDNN `torch.rope`。 |
@@ -185,6 +186,51 @@
 - 单测：`test_compact_permutation.py` 共 7 项通过，覆盖 raw `uint8` preallocated
   storage 与 expanded/stride-0 backward grad；其中 MUSA 测试需显式设置
   `RUN_MUSA_TESTS=1`。
+
+### 2026-08-03 — Wgrad、MATE MLA backward 与 DeepEP 长尾审计
+
+- 专用 ragged wgrad 原型：实现了直接消费 packed input/grad、动态非均匀 counts、
+  直接输出 FP32 `[experts, N, K]` 的单-launch Triton kernel，数值与 TE 逐元素一致。
+  生产型 `E128, M≈64, N=1536, K=2048` 为 `14.49 ms`，TE 为 `2.70 ms`；当前
+  两层测试的 `E32, M≈2K, N=7168, K=2048` 为 `513.7 ms`，TE 为 `6.22 ms`。
+  MATE K-contig BF16 临时输出在前一 shape 中为 `3.70 ms` kernel/zero 加 `3.45 ms`
+  transpose/cast，仍慢于 TE。原型未接入；继续优化必须新增 MUBIN/MUTLASS 专用
+  `[M,K] × [M,N] → FP32 [N,K]` epilogue，不能采用当前 Triton/MATE 临时转置路径。
+- MATE MLA backward：MATE 0.2.5 只支持统一 head dim 128/256，而当前 MLA 是
+  `Dqk=192, Dv=128`。补零到 256 的 backward 精度可接受（完整 shape dQ/dK 最大
+  绝对差 `0.00390625`，dV 一致），但 split plan `45.3 ms`，原生 MUSA backward
+  `15.5 ms`；deterministic separate plan 触发 kernel timeout。因此继续保留现有
+  MATE forward + native MUSA backward，不提交负优化。
+- DeepEP 长尾：当前内部 wheel 为 `deep_ep 1.1.0+9a0d761`，ACE Python API
+  `dispatch_ace/combine_ace` 不接受 config，因此 `--moe-deepep-num-sms` 20/40/60
+  对 ACE 无实际影响。ACE buffer 1→2、4-core/避让 housekeeping 绑核均无稳定收益；
+  标准 DeepEP 30-step 由约 `711.9` 退到 `749.1 ms`。长等待会在 EP peers 之间
+  转移，属于 peer-arrival/D2D contention；根治需要修改 DeepEP ACE 二进制并用完整
+  EP8 traces 配对发送/接收 rank，Python cache 或 rank-local barrier 不能缩短关键路径。
+
+### 2026-08-03 — MLA q/kv down-projection fusion
+
+- 主要文件：
+  - `megatron-lm-musa-patch/musa_patch/fused_mla_down_projection.py`
+  - `Megatron-LM/megatron/core/transformer/multi_latent_attention.py`
+  - `megatron-lm-musa-patch/test/test_fused_mla_down_projection.py`
+  - ws128 启动脚本与本文档
+- 实现：q-lora down projection 和 kv-lora/rope down projection 共享相同 hidden input。
+  forward 临时 pack 两个 weight 后只下发一个 GEMM；backward 把 q/kv output grad pack 后
+  只下发一个 dgrad GEMM。两个原始 Parameter、checkpoint key 和 optimizer state 均不变；
+  wgrad 仍分别写入原 q/kv FP32 `main_grad`，不生成额外 FP32 packed grad。
+- 默认与回退：`MUSA_FUSED_MLA_DOWN_PROJ=1` 默认启用；仅接管 MUSA FP16/BF16、
+  `q_lora_rank != None`、TP1、无 linear bias 且连续 weight 的路径。TP>1、bias、其他
+  dtype/device 或显式设为 `0` 时自动回退原两个 Linear。
+- 算子性能，`tokens=8192, H=7168, q_rank=1536, kv+rope=576`：forward prepacked
+  `0.743 → 0.674 ms`，dgrad `0.952 → 0.625 ms`；wgrad 一个大 GEMM与两个原 GEMM
+  均约 `0.710 ms`，因此保留两个独立 main_grad wgrad。
+- 两层训练：单机 8×S5000、seq4096、MBS2、BF16、EP8、full recompute、fake data、
+  force-load-balancing。三组正反顺序 30-step A/B 的稳态中位数平均减少约 `0.87 ms`，
+  MAD 过滤均值平均减少约 `1.28 ms`；trace 中全部 GEMM 8-rank 均值减少 `0.45 ms`，
+  copy/cast 增加约 `0.14 ms`。max allocated `64003 → 64020 MB`。
+- 精度：三组训练 hidden loss 最大相对差 `0.016%`，无 NaN/skipped iteration；MUSA
+  单测覆盖 forward、fused dgrad、两个独立 FP32 main_grad wgrad，共 3 项通过。
 
 ## 当前已知边界
 

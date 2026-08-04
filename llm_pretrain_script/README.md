@@ -154,6 +154,24 @@ force-load-balancing 的 8-rank trace 中，四段 local permutation kernel 总�
 30-step A/B 的稳态中位数均改善，分别为 `-3.0 ms` 和 `-2.3 ms`；生产拓扑仍需
 独立复测。
 
+## MLA q/kv down-projection fusion
+
+`MUSA_FUSED_MLA_DOWN_PROJ=1` 默认在 TP1、无 linear bias 的 MUSA FP16/BF16 MLA
+路径中合并 q-lora 与 kv-lora/rope down projection。forward 和 dgrad 各由两个 GEMM
+变为一个 GEMM；两个原始 Parameter、checkpoint key、optimizer state 和 FP32
+`main_grad` 保持不变，因此无需转换旧 checkpoint。
+
+其他 dtype/device、TP>1、启用 bias 或 `q_lora_rank=None` 时自动回退。需要 A/B 时：
+
+```bash
+export MUSA_FUSED_MLA_DOWN_PROJ=0
+```
+
+单机 8×S5000、两层、seq4096、MBS2、BF16、EP8、full recompute 的三组正反顺序
+30-step A/B 中，稳态中位数平均减少约 `0.87 ms`，MAD 过滤均值平均减少约
+`1.28 ms`；hidden loss 最大相对差 `0.016%`，无 NaN/skip。该小幅收益需要在生产
+PP16/EP8 拓扑再次确认。
+
 ## MATE MLA FlashAttention forward
 
 DeepSeek MLA 的 BF16 fixed-length attention 默认使用混合实现：
