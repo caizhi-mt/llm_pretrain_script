@@ -9,6 +9,7 @@
 #include <mutex>
 #include <numeric>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 // MUTLASS 0.3-dev headers have an order dependency; keep this block intact.
@@ -86,18 +87,24 @@ using DownConfig = WgradConfig<256, 128, 32, 4>;
 // dY.T[4096, M] @ X[M, 7168]. This large-M tuning is deliberately separate
 // from the production-like E128 small-M kernels above.
 using E32GateUpConfig = WgradConfig<256, 384, 32, 4>;
+// Current single-node DeepSeek-v3 expert fc2:
+// dY.T[7168, M] @ X[M, 2048]. Four ragged experts share each launch to fill
+// the short output-tile grid without changing the per-expert reduction order.
+using E32DownConfig = WgradConfig<384, 256, 32, 4>;
 
 constexpr int kMaxE32Experts = 32;
 constexpr int kE32GroupsPerLaunch = 4;
 
-struct KGroupedKernelParams {
-  typename E32GateUpConfig::GemmKernel::Params groups[kE32GroupsPerLaunch];
+template <class Config> struct KGroupedKernelParams {
+  typename Config::GemmKernel::Params groups[kE32GroupsPerLaunch];
 };
-static_assert(sizeof(KGroupedKernelParams) <= 4096,
+static_assert(sizeof(KGroupedKernelParams<E32GateUpConfig>) <= 4096,
+              "MP31 FC1 K-grouped kernel arguments must stay within 4 KiB");
+static_assert(sizeof(KGroupedKernelParams<E32DownConfig>) <= 4096,
               "MP31 K-grouped kernel arguments must stay within 4 KiB");
 
-using E32GemmKernel = typename E32GateUpConfig::GemmKernel;
-using E32Gemm = typename E32GateUpConfig::Gemm;
+using E32GateUpGemmKernel = typename E32GateUpConfig::GemmKernel;
+using E32DownGemmKernel = typename E32DownConfig::GemmKernel;
 
 // Keep the already tuned per-tile MP31 implementation, but expose four expert
 // grids to the device scheduler in each launch. GemmUniversal's static tile
@@ -106,14 +113,41 @@ using E32Gemm = typename E32GateUpConfig::Gemm;
 // packs exceed the current MP31 backend's register/argument allocation limit.
 MUTLASS_GLOBAL
 #ifdef __MUSACC__
-__launch_bounds__(E32GemmKernel::MaxThreadsPerBlock,
-                  E32GemmKernel::MinBlocksPerMultiprocessor)
+__launch_bounds__(E32GateUpGemmKernel::MaxThreadsPerBlock,
+                  E32GateUpGemmKernel::MinBlocksPerMultiprocessor)
 #endif
-    void e32_k_grouped_device_kernel(
-        MUTLASS_GRID_CONSTANT KGroupedKernelParams const params) {
+    void e32_gate_up_k_grouped_device_kernel(
+        MUTLASS_GRID_CONSTANT KGroupedKernelParams<E32GateUpConfig> const
+            params) {
   extern __shared__ char
-      __attribute__((aligned(E32GemmKernel::SmemAlignmentBytes))) smem[];
-  E32GemmKernel op;
+      __attribute__((aligned(E32GateUpGemmKernel::SmemAlignmentBytes))) smem[];
+  E32GateUpGemmKernel op;
+#define RUN_GROUP(group)                                                       \
+  case group:                                                                  \
+    op(params.groups[group], smem);                                            \
+    break
+  switch (blockIdx.y) {
+    RUN_GROUP(0);
+    RUN_GROUP(1);
+    RUN_GROUP(2);
+    RUN_GROUP(3);
+  default:
+    break;
+  }
+#undef RUN_GROUP
+}
+
+MUTLASS_GLOBAL
+#ifdef __MUSACC__
+__launch_bounds__(E32DownGemmKernel::MaxThreadsPerBlock,
+                  E32DownGemmKernel::MinBlocksPerMultiprocessor)
+#endif
+    void e32_down_k_grouped_device_kernel(
+        MUTLASS_GRID_CONSTANT KGroupedKernelParams<E32DownConfig> const
+            params) {
+  extern __shared__ char
+      __attribute__((aligned(E32DownGemmKernel::SmemAlignmentBytes))) smem[];
+  E32DownGemmKernel op;
 #define RUN_GROUP(group)                                                       \
   case group:                                                                  \
     op(params.groups[group], smem);                                            \
@@ -197,10 +231,16 @@ void launch_grouped_wgrad(torch::Tensor input, torch::Tensor grad_output,
   C10_MUSA_CHECK(musaGetLastError());
 }
 
+template <class Config>
 void launch_e32_k_grouped_wgrad(torch::Tensor input, torch::Tensor grad_output,
                                 const std::vector<int64_t> &counts,
                                 const std::vector<torch::Tensor> &outputs,
                                 musaStream_t stream) {
+  using GemmKernel = typename Config::GemmKernel;
+  using Gemm = typename Config::Gemm;
+  static_assert(std::is_same_v<Config, E32GateUpConfig> ||
+                    std::is_same_v<Config, E32DownConfig>,
+                "unsupported MP31 E32 K-grouped config");
   TORCH_CHECK(counts.size() <= kMaxE32Experts,
               "MP31 K-grouped wgrad supports at most ", kMaxE32Experts,
               " experts, got ", counts.size());
@@ -216,11 +256,18 @@ void launch_e32_k_grouped_wgrad(torch::Tensor input, torch::Tensor grad_output,
                       static_cast<int>(configure_dynamic_smem.size()),
               "unsupported MUSA device index: ", device_index);
   std::call_once(configure_dynamic_smem[device_index], [] {
-    if constexpr (E32GemmKernel::SharedStorageSize >= (48 << 10)) {
-      C10_MUSA_CHECK(
-          musaFuncSetAttribute(e32_k_grouped_device_kernel,
-                               musaFuncAttributeMaxDynamicSharedMemorySize,
-                               E32GemmKernel::SharedStorageSize));
+    if constexpr (GemmKernel::SharedStorageSize >= (48 << 10)) {
+      if constexpr (std::is_same_v<Config, E32GateUpConfig>) {
+        C10_MUSA_CHECK(
+            musaFuncSetAttribute(e32_gate_up_k_grouped_device_kernel,
+                                 musaFuncAttributeMaxDynamicSharedMemorySize,
+                                 GemmKernel::SharedStorageSize));
+      } else {
+        C10_MUSA_CHECK(
+            musaFuncSetAttribute(e32_down_k_grouped_device_kernel,
+                                 musaFuncAttributeMaxDynamicSharedMemorySize,
+                                 GemmKernel::SharedStorageSize));
+      }
     }
   });
 
@@ -248,7 +295,7 @@ void launch_e32_k_grouped_wgrad(torch::Tensor input, torch::Tensor grad_output,
   std::sort(expert_order.begin(), expert_order.end(),
             [&](size_t lhs, size_t rhs) { return counts[lhs] > counts[rhs]; });
 
-  std::array<E32GemmKernel::Params, kMaxE32Experts> active_params;
+  std::array<typename GemmKernel::Params, kMaxE32Experts> active_params;
   int active_groups = 0;
   for (size_t expert : expert_order) {
     int const tokens = static_cast<int>(counts[expert]);
@@ -259,41 +306,44 @@ void launch_e32_k_grouped_wgrad(torch::Tensor input, torch::Tensor grad_output,
     auto *expert_out = outputs[expert].data_ptr<float>();
     auto problem_shape = make_shape(n_features, k_features, tokens);
     auto stride_a = mutlass::make_mute_packed_stride(
-        typename E32GemmKernel::StrideA{}, make_shape(n_features, tokens, 1));
+        typename GemmKernel::StrideA{}, make_shape(n_features, tokens, 1));
     auto stride_b = mutlass::make_mute_packed_stride(
-        typename E32GemmKernel::StrideB{}, make_shape(k_features, tokens, 1));
-    auto stride_c =
-        mutlass::make_mute_packed_stride(typename E32GemmKernel::StrideC{},
-                                         make_shape(n_features, k_features, 1));
-    auto stride_d =
-        mutlass::make_mute_packed_stride(typename E32GemmKernel::StrideD{},
-                                         make_shape(n_features, k_features, 1));
+        typename GemmKernel::StrideB{}, make_shape(k_features, tokens, 1));
+    auto stride_c = mutlass::make_mute_packed_stride(
+        typename GemmKernel::StrideC{}, make_shape(n_features, k_features, 1));
+    auto stride_d = mutlass::make_mute_packed_stride(
+        typename GemmKernel::StrideD{}, make_shape(n_features, k_features, 1));
 
-    typename E32Gemm::Arguments arguments{
+    typename Gemm::Arguments arguments{
         mutlass::gemm::GemmUniversalMode::kGemm,
         problem_shape,
         {dy + offsets[expert] * n_features, stride_a,
          x + offsets[expert] * k_features, stride_b},
         {{alpha, beta}, expert_out, stride_c, expert_out, stride_d}};
     active_params[active_groups++] =
-        E32GemmKernel::to_underlying_arguments(arguments, nullptr);
+        GemmKernel::to_underlying_arguments(arguments, nullptr);
   }
 
-  dim3 grid = E32GemmKernel::get_grid_shape(active_params[0]);
+  dim3 grid = GemmKernel::get_grid_shape(active_params[0]);
   TORCH_CHECK(grid.y == 1 && grid.z == 1,
               "unexpected base grid for MP31 K-grouped wgrad: ", grid.x, "x",
               grid.y, "x", grid.z);
-  dim3 const block = E32GemmKernel::get_block_shape();
+  dim3 const block = GemmKernel::get_block_shape();
   for (int first = 0; first < active_groups; first += kE32GroupsPerLaunch) {
-    KGroupedKernelParams grouped_params;
+    KGroupedKernelParams<Config> grouped_params;
     int const groups_this_launch =
         std::min(kE32GroupsPerLaunch, active_groups - first);
     for (int group = 0; group < groups_this_launch; ++group) {
       grouped_params.groups[group] = active_params[first + group];
     }
     grid.y = static_cast<unsigned int>(groups_this_launch);
-    e32_k_grouped_device_kernel<<<grid, block, E32GemmKernel::SharedStorageSize,
-                                  stream>>>(grouped_params);
+    if constexpr (std::is_same_v<Config, E32GateUpConfig>) {
+      e32_gate_up_k_grouped_device_kernel<<<
+          grid, block, GemmKernel::SharedStorageSize, stream>>>(grouped_params);
+    } else {
+      e32_down_k_grouped_device_kernel<<<
+          grid, block, GemmKernel::SharedStorageSize, stream>>>(grouped_params);
+    }
   }
   C10_MUSA_CHECK(musaGetLastError());
 }
@@ -361,16 +411,25 @@ void mutlass_wgrad_accumulate_musa(torch::Tensor input,
               "MP31 MUTLASS wgrad requires MUSA capability 3.1, got ",
               device_properties.major, ".", device_properties.minor);
   musaStream_t stream = at::musa::getCurrentMUSAStream().stream();
+  static bool const use_k_grouped = [] {
+    char const *value = std::getenv("MUTLASS_WGRAD_E32_K_GROUPED");
+    return value == nullptr || std::string(value) != "0";
+  }();
   if (grad_output.size(1) == 4096 && input.size(1) == 7168) {
-    static bool const use_k_grouped = [] {
-      char const *value = std::getenv("MUTLASS_WGRAD_E32_K_GROUPED");
-      return value == nullptr || std::string(value) != "0";
-    }();
     if (use_k_grouped) {
-      launch_e32_k_grouped_wgrad(input, grad_output, counts, outputs, stream);
+      launch_e32_k_grouped_wgrad<E32GateUpConfig>(input, grad_output, counts,
+                                                  outputs, stream);
     } else {
       launch_grouped_wgrad<E32GateUpConfig>(input, grad_output, counts, outputs,
                                             stream);
+    }
+  } else if (grad_output.size(1) == 7168 && input.size(1) == 2048) {
+    if (use_k_grouped) {
+      launch_e32_k_grouped_wgrad<E32DownConfig>(input, grad_output, counts,
+                                                outputs, stream);
+    } else {
+      launch_grouped_wgrad<E32DownConfig>(input, grad_output, counts, outputs,
+                                          stream);
     }
   } else if (input.size(1) <= 1024) {
     launch_grouped_wgrad<DownConfig>(input, grad_output, counts, outputs,

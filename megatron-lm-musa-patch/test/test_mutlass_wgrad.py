@@ -36,7 +36,7 @@ def test_selects_benchmarked_nonuniform_small_m_shapes():
     assert select(out_features=2048, in_features=768) == "down"
 
 
-def test_selects_actual_e32_large_m_fc1_only():
+def test_selects_actual_e32_large_m_fc1_and_fc2():
     assert (
         select(
             num_experts=32,
@@ -55,7 +55,7 @@ def test_selects_actual_e32_large_m_fc1_only():
             in_features=2048,
             max_tokens=3060,
         )
-        is None
+        == "e32_down"
     )
 
 
@@ -83,7 +83,8 @@ def test_alignment_helper_rejects_contiguous_offset_view():
 
 
 @pytest.mark.parametrize(
-    "n_features,k_features", [(256, 2048), (256, 64), (4096, 7168)]
+    "n_features,k_features",
+    [(256, 2048), (256, 64), (4096, 7168), (7168, 2048)],
 )
 def test_native_two_microbatch_accumulation_on_mp31(n_features, k_features):
     if os.getenv("RUN_MUTLASS_WGRAD_MUSA_TESTS", "0") != "1":
@@ -148,7 +149,8 @@ def test_native_two_microbatch_accumulation_on_mp31(n_features, k_features):
         torch.testing.assert_close(result, expected, atol=2.0e-5, rtol=2.0e-5)
 
 
-def test_e32_k_grouped_cross_launch_and_zero_expert_on_mp31():
+@pytest.mark.parametrize("n_features,k_features", [(4096, 7168), (7168, 2048)])
+def test_e32_k_grouped_cross_launch_and_zero_expert_on_mp31(n_features, k_features):
     if os.getenv("RUN_MUTLASS_WGRAD_MUSA_TESTS", "0") != "1":
         pytest.skip("set RUN_MUTLASS_WGRAD_MUSA_TESTS=1 for the MP31 test")
 
@@ -164,15 +166,18 @@ def test_e32_k_grouped_cross_launch_and_zero_expert_on_mp31():
 
     device = torch.device("musa:0")
     torch.musa.set_device(device)
-    splits = [61, 0, 65, 64, 63]
+    # Five active experts force a second group4 launch; the zero expert also
+    # verifies that beta=1 leaves its existing main_grad untouched.
+    splits = [61, 0, 65, 64, 63, 67]
     torch.manual_seed(1701)
-    x = torch.randn(sum(splits), 7168, device=device, dtype=torch.bfloat16)
-    dy = torch.randn(sum(splits), 4096, device=device, dtype=torch.bfloat16)
+    x = torch.randn(sum(splits), k_features, device=device, dtype=torch.bfloat16)
+    dy = torch.randn(sum(splits), n_features, device=device, dtype=torch.bfloat16)
     reference = [
-        torch.randn(4096, 7168, device=device, dtype=torch.float32)
+        torch.randn(n_features, k_features, device=device, dtype=torch.float32)
         for _ in splits
     ]
     actual = [output.clone() for output in reference]
+    zero_initial = actual[1].clone()
 
     general_grouped_gemm(
         list(torch.split(x, splits)),
@@ -191,3 +196,4 @@ def test_e32_k_grouped_cross_launch_and_zero_expert_on_mp31():
 
     for result, expected in zip(actual, reference):
         torch.testing.assert_close(result, expected, atol=2.0e-5, rtol=2.0e-5)
+    torch.testing.assert_close(actual[1], zero_initial, atol=0, rtol=0)

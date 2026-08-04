@@ -19,8 +19,8 @@
 | `MOE_GROUPED_GEMM` | `1` | 使用 GroupedMLP；设为 `0` 回退 SequentialMLP。 |
 | `MATE_GROUPED_GEMM` | `1` | MoE expert fprop/dgrad 使用 MATE，wgrad 默认使用 TE；设为 `0` 完整回退 TE GroupedLinear。 |
 | `MATE_USE_MAIN_GRAD` | `1` | wgrad 直写 FP32 `main_grad`；设为 `0` 返回临时 weight grad。 |
-| `MUTLASS_WGRAD` | `0` | 实验性启用已验证 E128 小-M，以及 E32 `[4096,7168]` FC1 的 MP31 MUTLASS beta=1 wgrad；首 microbatch、FC2 和其他 shape 自动走 TE。 |
-| `MUTLASS_WGRAD_E32_K_GROUPED` | `1` | E32 FC1 stage4 按动态 reduction-K 排序并每 4 个 expert 合并 launch；设为 `0` 回退逐 expert stage4，用于 A/B。 |
+| `MUTLASS_WGRAD` | `0` | 实验性启用已验证 E128 小-M，以及 E32 `[4096,7168]` FC1/`[7168,2048]` FC2 的 MP31 MUTLASS beta=1 wgrad；首 microbatch 和其他 shape 自动走 TE。 |
+| `MUTLASS_WGRAD_E32_K_GROUPED` | `1` | E32 FC1/FC2 stage4 按动态 reduction-K 排序并每 4 个 expert 合并 launch；设为 `0` 回退逐 expert stage4，用于 A/B。 |
 | `MATE_FLASH_ATTN` | `1` | BF16 MLA FA forward 使用 MATE MUBIN，backward 保持原生 MUSA；设为 `0` 完整回退原 TE FA。 |
 | `MATE_CACHE_MUBIN_DISPATCH` | `1` | 缓存 GroupGEMM/FA 不可变 MUBIN module、dispatcher、最终 `GemmMubinId` kernel path 与 launch handle；不缓存 tensor、路由 counts、LSE 或算子输出。 |
 | `MATE_DEFER_DEEPEP_COUNTS` | `1` | 延迟构造 device counts，并从 device routing map 归约得到；设为 `0` 回退 dispatch 后立即构造 device tensor。 |
@@ -245,20 +245,22 @@
   每个 expert 独立的 FP32 `[N,K] main_grad`；A/B 分别用 ColumnMajor/RowMajor
   零拷贝解释现有 storage，不生成 K-contig 临时输出、transpose 或 BF16→FP32 add。
   gate_up 使用 `256×256×32, stage=5`，down 使用 `256×128×32, stage=4`；E32 FC1
-  使用 `256×384×32, stage=4`，并按动态 reduction-K 降序每 4 个 expert 合并 launch。
-  三者均使用 `KernelTme + WithTme` epilogue。动态 counts 和所有 tensor pointer 每次
+  使用 `256×384×32, stage=4`，E32 FC2 使用 `384×256×32, stage=4`，并按动态
+  reduction-K 降序每 4 个 expert 合并 launch。四者均使用 `KernelTme + WithTme`
+  epilogue。动态 counts 和所有 tensor pointer 每次
   调用重新传入，不缓存路由、tensor 或输出。
 - Dispatch 与回退：新增 `MUTLASS_WGRAD=0`，默认关闭。设为 `1` 后在 E128
-  `[N,K]=[1536,2048]`/`[2048,768]` 小-M，以及 E32 `[4096,7168]` FC1 的已验证
-  范围内生效，且都要求 BF16 与 beta=1 FP32 main-grad 累加。首个 microbatch、
-  E32 FC2、非 main-grad 和未验证 shape 继续走原 TE。
+  `[N,K]=[1536,2048]`/`[2048,768]` 小-M，以及 E32 `[4096,7168]` FC1/
+  `[7168,2048]` FC2 的已验证范围内生效，且都要求 BF16 与 beta=1 FP32 main-grad
+  累加。首个 microbatch、非 main-grad 和未验证 shape 继续走原 TE。
 - 精度：独立/非连续 output tensor、零 token expert、奇数且非均匀 counts 均通过；
   连续 10 次累加每次更换路由（counts min `22–30`、max `100–121`），gate_up/down
   相对 TE 均为逐元素一致。非 distributed patch 测试 `45 passed, 4 skipped`；显式
   MP31 测试两项通过，覆盖两个 config、TE beta=0→native beta=1、零/动态 counts 与
-  non-default stream。新增 E32 group4 后，目标测试 `11 passed, 4 skipped`，显式 MP31
-  测试 `10 passed`，覆盖跨 grouped launch、零 expert 和 non-default stream。另有
-  Python/native 双层 pointer alignment 和 MP31 capability guard。
+  non-default stream。本次 FC2 接入后，CPU 目标测试 `11 passed, 6 skipped`，显式
+  MP31 FC1/FC2 测试 `6 passed`，FC2 逐 expert 回退测试 `1 passed`；覆盖真正跨
+  grouped launch（5 个非零 expert）、零 expert、两 microbatch 累积和 non-default
+  stream。另有 Python/native 双层 pointer alignment 和 MP31 capability guard。
 - 单卡微测：MTT S5000，BF16，E128，总 M=8192，counts `[25,100]`。gate_up
   TE/MUTLASS beta=1 中位数 `6.386/3.559 ms`（`-44.3%`）；down
   `4.405/3.282 ms`（`-25.5%`）。beta=0 native 仍比 TE 慢，因此没有接管。E32
@@ -267,7 +269,13 @@
   约 `266 TFLOPS`；轻度非均匀 counts 为 `16.516/14.269 ms`，快 `13.6%`，约
   `269 TFLOPS`，三组均相对 TE 逐元素一致。逐 expert stage4 为 `15.729 ms`，说明
   group4 本身再减少约 `8.3%`；group8 和 beta=1 专用 epilogue 实测更慢，均未保留。
-  E32 FC2 与 TE 持平，因此仍走 TE。
+  E32 FC2 最终采用 `384×256×32, stage=4 + group4`：四组偏斜 counts 下
+  TE/MUTLASS 中位数约 `7.95–7.97/7.57–7.59 ms`，快 `4.6%–5.1%`；轻度非均匀
+  counts 为 `8.06/7.53 ms`，快 `6.5%`，约 `254–256 TFLOPS`。K64、stage5、
+  `256×384` 与更大 tile 均更慢、launch 失败或编译器 regalloc 失败，因此未保留。
+  5 组连续动态路由（含 4 个零 token expert）、非零 FP32 初值 beta=1、跨 launch、
+  重复调用和非默认 stream 均相对 TE 通过 `rtol=atol=1e-3`，最大绝对误差
+  `1.37e-4`；native 每次调用无额外 allocated/reserved device workspace。
 - 两 microbatch 组合微测（首个 TE beta=0，第二个 native beta=1）：gate_up
   `8.210/5.509 ms`，耗时减少 `32.9%`；down `5.742/4.804 ms`，耗时减少 `16.3%`，
   两组最终 FP32 main_grad 均与全 TE 逐元素一致。
@@ -282,9 +290,9 @@
   默认关闭，不能仅凭 microbenchmark 宣称端到端训练收益或生产可用。
 - 构建：启动时使用 MATE 0.2.5 wheel 内置 MUTLASS JIT 编译，cache key 包含源码、
   wrapper、flags、MATE/PyTorch/torch_musa 版本；仓库 wrapper 兼容当前旧 torch_musa
-  loader 生成的 `--compiler-options -fPIC`，并支持 `MUSA_HOME`/`MUSA_PATH`。E32 多
-  microbatch 尚未做完整训练/trace A/B；在此之前保持默认关闭，不能把算子收益等同于生产
-  step-time 收益。
+  loader 生成的 `--compiler-options -fPIC`，并支持 `MUSA_HOME`/`MUSA_PATH`。E32
+  FC1+FC2 多 microbatch 尚未做完整训练/trace A/B；在此之前保持默认关闭，不能把算子
+  收益等同于生产 step-time 收益。
 
 ## 当前已知边界
 

@@ -16,6 +16,7 @@ _SUPPORTED_SHAPES = {
     (128, 1536, 2048): 512,
     (128, 2048, 768): 512,
     (32, 4096, 7168): 2304,
+    (32, 7168, 2048): 2304,
 }
 
 
@@ -43,9 +44,7 @@ def select_mutlass_wgrad(
     """Return the tuned kernel family, or None when TE is the safe choice."""
     if not use_main_grad or not accumulate:
         return None
-    max_average = _SUPPORTED_SHAPES.get(
-        (num_experts, out_features, in_features)
-    )
+    max_average = _SUPPORTED_SHAPES.get((num_experts, out_features, in_features))
     if max_average is None or total_tokens > num_experts * max_average:
         return None
     # The tested nonuniform distributions reach roughly 1.55x the average.
@@ -54,7 +53,7 @@ def select_mutlass_wgrad(
     if max_tokens > 2 * max_average:
         return None
     if num_experts == 32:
-        return "e32_gate_up"
+        return "e32_down" if in_features == 2048 else "e32_gate_up"
     return "down" if in_features <= 1024 else "gate_up"
 
 

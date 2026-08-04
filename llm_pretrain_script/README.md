@@ -123,13 +123,14 @@ export MATE_FLASH_ATTN=1
 
 `MUTLASS_WGRAD=1` 会在启动阶段从 MATE wheel 自带的 MUTLASS 头文件 JIT 编译 MP31
 kernel。已验证选择包括 E128 `[N,K]=[1536,2048]`/`[2048,768]` 小-M，以及 E32
-`[4096,7168]` FC1（平均每 expert 不超过 2304 token、最长不超过 4608 token）。
-只接管 FP32 `main_grad` 已有梯度的 beta=1 累加；首个 microbatch、E32 FC2、本表之外
-的 shape 和所有不满足条件的情况仍走 TE。
+`[4096,7168]` FC1/`[7168,2048]` FC2（平均每 expert 不超过 2304 token、最长不超过
+4608 token）。只接管 FP32 `main_grad` 已有梯度的 beta=1 累加；首个 microbatch、
+本表之外的 shape 和所有不满足条件的情况仍走 TE。
 counts、input、dY 和 `main_grad` 指针每次调用都重新传入，不缓存路由或 tensor。
-E32 FC1 默认用 stage4，并把动态 counts 按 K 从大到小排序后每 4 个 expert 合并为
-一次 launch；`MUTLASS_WGRAD_E32_K_GROUPED=0` 可回退同一 stage4 kernel 的逐 expert
-launch，仅用于 A/B 和故障排查。
+E32 FC1 使用 `256×384×32, stage=4`，FC2 使用 `384×256×32, stage=4`；二者都把
+动态 counts 按 K 从大到小排序后每 4 个 expert 合并为一次 launch。
+`MUTLASS_WGRAD_E32_K_GROUPED=0` 可回退对应 stage4 kernel 的逐 expert launch，仅用于
+A/B 和故障排查。
 该 E32 路径已完成算子级非均匀 counts、零 expert 和非默认 stream 验证，但多
 microbatch 训练/Trace A/B 尚未完成，因此 `MUTLASS_WGRAD` 继续默认关闭。
 
