@@ -1,10 +1,10 @@
-"""Opt-in MATE BF16 GroupedLinear fast path for MoE experts on MUSA.
+"""MATE BF16 GroupedLinear fast path for MoE experts on MUSA.
 
 The patch keeps Transformer Engine's module, parameters, and state-dict
-format. MATE handles BF16 fprop and dgrad, while Transformer Engine handles
-wgrad through one ``general_grouped_gemm`` call. The fast configuration writes
-wgrad directly into the persistent FP32 ``main_grad`` buffer, avoiding a BF16
-temporary gradient and the subsequent BF16-to-FP32 accumulation pass.
+format. MATE handles BF16 fprop and dgrad. Wgrad normally uses Transformer
+Engine; an optional guarded MP31 MUTLASS path accelerates benchmarked beta=1
+shapes. Both paths write directly into persistent FP32 ``main_grad``,
+avoiding a BF16 temporary and the subsequent BF16-to-FP32 accumulation pass.
 """
 
 from __future__ import annotations
@@ -238,12 +238,6 @@ class _MateGroupedLinear(torch.autograd.Function):
 
         wgrads = [None] * num_experts
         if any(ctx.needs_input_grad[4:]):
-            from transformer_engine.pytorch.cpp_extensions.gemm import general_grouped_gemm
-            from transformer_engine.pytorch.module.base import (
-                _2X_ACC_WGRAD,
-                get_multi_stream_cublas_workspace,
-            )
-
             if ctx.use_main_grad:
                 wgrad_outputs = [weight.main_grad for weight in weights]
                 grad_added_flags = [
@@ -269,21 +263,70 @@ class _MateGroupedLinear(torch.autograd.Function):
                 wgrad_outputs = [torch.empty_like(weight) for weight in weights]
                 accumulate = False
 
-            input_mats = torch.split(flat_inp, ctx.m_splits)
-            grad_output_mats = torch.split(grad_output, ctx.m_splits)
-            with torch.profiler.record_function("mate_te_grouped_gemm_wgrad"):
-                general_grouped_gemm(
-                    list(input_mats),
-                    list(grad_output_mats),
+            mutlass_kernel = None
+            if env_flag("MUTLASS_WGRAD", "0"):
+                from .mutlass_wgrad import can_use_mutlass_wgrad
+
+                mutlass_kernel = can_use_mutlass_wgrad(
+                    flat_inp,
+                    grad_output,
+                    ctx.m_splits,
                     wgrad_outputs,
-                    wgrad_outputs[0].dtype,
-                    get_multi_stream_cublas_workspace(),
-                    layout="NT",
-                    m_splits=list(ctx.m_splits),
-                    grad=True,
+                    use_main_grad=ctx.use_main_grad,
                     accumulate=accumulate,
-                    use_split_accumulator=_2X_ACC_WGRAD,
                 )
+                if env_flag("MUTLASS_WGRAD_DEBUG", "0"):
+                    _log_mutlass_decision(
+                        len(ctx.m_splits),
+                        flat_inp.shape[0],
+                        grad_output.shape[1],
+                        flat_inp.shape[1],
+                        min(ctx.m_splits),
+                        max(ctx.m_splits),
+                        ctx.use_main_grad,
+                        accumulate,
+                        flat_inp.is_contiguous(),
+                        grad_output.is_contiguous(),
+                        wgrad_outputs[0].dtype,
+                        wgrad_outputs[0].shape,
+                        wgrad_outputs[0].is_contiguous(),
+                        mutlass_kernel,
+                    )
+
+            if mutlass_kernel is not None:
+                from .mutlass_wgrad import mutlass_wgrad_accumulate
+
+                _log_mutlass_kernel(mutlass_kernel)
+                with torch.profiler.record_function(
+                    "mate_mutlass_grouped_gemm_wgrad_accumulate"
+                ):
+                    mutlass_wgrad_accumulate(
+                        flat_inp, grad_output, ctx.m_splits, wgrad_outputs
+                    )
+            else:
+                from transformer_engine.pytorch.cpp_extensions.gemm import (
+                    general_grouped_gemm,
+                )
+                from transformer_engine.pytorch.module.base import (
+                    _2X_ACC_WGRAD,
+                    get_multi_stream_cublas_workspace,
+                )
+
+                input_mats = torch.split(flat_inp, ctx.m_splits)
+                grad_output_mats = torch.split(grad_output, ctx.m_splits)
+                with torch.profiler.record_function("mate_te_grouped_gemm_wgrad"):
+                    general_grouped_gemm(
+                        list(input_mats),
+                        list(grad_output_mats),
+                        wgrad_outputs,
+                        wgrad_outputs[0].dtype,
+                        get_multi_stream_cublas_workspace(),
+                        layout="NT",
+                        m_splits=list(ctx.m_splits),
+                        grad=True,
+                        accumulate=accumulate,
+                        use_split_accumulator=_2X_ACC_WGRAD,
+                    )
 
             if ctx.use_main_grad:
                 # Megatron DDP must not add a second copy of this gradient.
@@ -414,6 +457,38 @@ def _host_splits(m_splits):
     return m_splits.tolist()
 
 
+@functools.lru_cache(maxsize=None)
+def _log_mutlass_kernel(kernel: str) -> None:
+    _log(f"native MUTLASS wgrad accumulation active: {kernel}")
+
+
+@functools.lru_cache(maxsize=None)
+def _log_mutlass_decision(
+    experts,
+    total_tokens,
+    out_features,
+    in_features,
+    min_tokens,
+    max_tokens,
+    use_main_grad,
+    accumulate,
+    input_contiguous,
+    grad_contiguous,
+    output_dtype,
+    output_shape,
+    output_contiguous,
+    selected,
+) -> None:
+    _log(
+        "MUTLASS decision "
+        f"E={experts} totalM={total_tokens} N={out_features} K={in_features} "
+        f"counts=[{min_tokens},{max_tokens}] main_grad={use_main_grad} "
+        f"accumulate={accumulate} input_contig={input_contiguous} "
+        f"grad_contig={grad_contiguous} output={output_dtype}{tuple(output_shape)} "
+        f"output_contig={output_contiguous} selected={selected}"
+    )
+
+
 def install_mate_grouped_gemm() -> None:
     """Install the opt-in GroupedLinear patch before model construction."""
     import transformer_engine.pytorch as te
@@ -421,6 +496,15 @@ def install_mate_grouped_gemm() -> None:
     grouped_linear = te.GroupedLinear
     if getattr(grouped_linear, "_mate_grouped_gemm_installed", False):
         return
+
+    if env_flag("MUTLASS_WGRAD", "0"):
+        from .mutlass_wgrad import is_mp31_device, load_mutlass_wgrad
+
+        if is_mp31_device():
+            load_mutlass_wgrad()
+            _log("native MP31 MUTLASS wgrad extension loaded")
+        else:
+            _log("native MUTLASS wgrad disabled: current device is not MP31")
 
     original_init = grouped_linear.__init__
     original_forward = grouped_linear.forward
@@ -480,4 +564,6 @@ def install_mate_grouped_gemm() -> None:
     grouped_linear.__init__ = patched_init
     grouped_linear.forward = patched_forward
     grouped_linear._mate_grouped_gemm_installed = True
-    _log("installed: MATE fprop/dgrad + Transformer Engine grouped wgrad")
+    _log(
+        "installed: MATE fprop/dgrad + guarded MUTLASS/Transformer Engine wgrad"
+    )
