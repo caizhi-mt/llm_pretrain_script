@@ -18,7 +18,6 @@ export LOG_NAME=ws128_$(date +%Y%m%d)   # 每次新 run 换名，避免 cache/ck
 # BF16 expert fast path（默认开启；需要所有节点预装同版本 mate 与 mate-mubin）
 # export MATE_GROUPED_GEMM=0       # 置 0 回退 Transformer Engine GroupedLinear
 # export MATE_USE_MAIN_GRAD=0      # 置 0 禁用 wgrad 直写 FP32 main_grad
-# export MUTLASS_WGRAD=1           # 实验性启用已验证 shape 的 beta=1 MUTLASS wgrad
 # export MATE_FLASH_ATTN=0         # 置 0 回退原生 MUSA FlashAttention 前向
 # export MATE_CACHE_MUBIN_DISPATCH=0  # 置 0 禁用 GroupGEMM/FA MUBIN 元数据缓存
 # export MATE_DEFER_DEEPEP_COUNTS=0   # 置 0 回退 DeepEP counts 同步构造路径

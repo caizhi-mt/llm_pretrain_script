@@ -101,8 +101,7 @@ export PROFILE_STEP_END=6         # 可选,Megatron --profile-step-end,默认 6
 在 BF16、无 bias 的 GroupedMLP 上提供可回退的混合实现:
 
 - fprop/dgrad: MATE `ragged_m_moe_gemm_16bit`;
-- wgrad:默认使用 Transformer Engine `general_grouped_gemm(layout="NT")`；可选的
-  native MUTLASS 路径只接管已验证 shape 的后续 microbatch FP32 累加;
+- wgrad:单次 Transformer Engine `general_grouped_gemm(layout="NT")`;
 - wgrad 直接写 FP32 `main_grad`,不创建 BF16 临时梯度,也不增加后续 BF16→FP32 add/cast。
 
 该路径只局部接管 MoE expert GroupedLinear。ws128 现有的全局
@@ -113,26 +112,11 @@ export PROFILE_STEP_END=6         # 可选,Megatron --profile-step-end,默认 6
 ```bash
 export MATE_GROUPED_GEMM=1
 export MATE_USE_MAIN_GRAD=1
-export MUTLASS_WGRAD=0
-export MUTLASS_WGRAD_E32_K_GROUPED=1
 export MATE_FLASH_ATTN=1
 ```
 
-这些变量经 `cluster/dist_run_megatron.sh` 的 SSH 白名单传到所有节点。设置
+两个变量经 `cluster/dist_run_megatron.sh` 的 SSH 白名单传到所有节点。设置
 `MATE_GROUPED_GEMM=0` 可完整回退原 Transformer Engine GroupedLinear。
-
-`MUTLASS_WGRAD=1` 会在启动阶段从 MATE wheel 自带的 MUTLASS 头文件 JIT 编译 MP31
-kernel。已验证选择包括 E128 `[N,K]=[1536,2048]`/`[2048,768]` 小-M，以及 E32
-`[4096,7168]` FC1/`[7168,2048]` FC2（平均每 expert 不超过 2304 token、最长不超过
-4608 token）。只接管 FP32 `main_grad` 已有梯度的 beta=1 累加；首个 microbatch、
-本表之外的 shape 和所有不满足条件的情况仍走 TE。
-counts、input、dY 和 `main_grad` 指针每次调用都重新传入，不缓存路由或 tensor。
-E32 FC1 使用 `256×384×32, stage=4`，FC2 使用 `384×256×32, stage=4`；二者都把
-动态 counts 按 K 从大到小排序后每 4 个 expert 合并为一次 launch。
-`MUTLASS_WGRAD_E32_K_GROUPED=0` 可回退对应 stage4 kernel 的逐 expert launch，仅用于
-A/B 和故障排查。
-该 E32 路径已完成算子级非均匀 counts、零 expert 和非默认 stream 验证，但多
-microbatch 训练/Trace A/B 尚未完成，因此 `MUTLASS_WGRAD` 继续默认关闭。
 
 依赖与限制:
 

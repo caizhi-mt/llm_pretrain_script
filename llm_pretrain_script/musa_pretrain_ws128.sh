@@ -245,13 +245,10 @@ fi
 
 # BF16 MoE expert fast path:
 #   fprop/dgrad: MATE ragged-M GroupGEMM
-#   wgrad:       TE by default; optional guarded MUTLASS beta=1 accumulation
-# MATE fprop/dgrad is enabled by default; experimental MUTLASS wgrad stays off.
-# Every node must have matching mate and mate-mubin packages.
+#   wgrad:       one Transformer Engine grouped GEMM call, directly into FP32 main_grad
+# Enabled by default; every node must have matching mate and mate-mubin packages.
 export MATE_GROUPED_GEMM=${MATE_GROUPED_GEMM:-1}
 export MATE_USE_MAIN_GRAD=${MATE_USE_MAIN_GRAD:-1}
-export MUTLASS_WGRAD=${MUTLASS_WGRAD:-0}
-export MUTLASS_WGRAD_E32_K_GROUPED=${MUTLASS_WGRAD_E32_K_GROUPED:-1}
 export MATE_FLASH_ATTN=${MATE_FLASH_ATTN:-1}
 export MATE_CACHE_MUBIN_DISPATCH=${MATE_CACHE_MUBIN_DISPATCH:-1}
 export MATE_DEFER_DEEPEP_COUNTS=${MATE_DEFER_DEEPEP_COUNTS:-1}
@@ -259,7 +256,7 @@ export MUSA_COMPACT_PERMUTE=${MUSA_COMPACT_PERMUTE:-1}
 export MUSA_FUSED_MLA_DOWN_PROJ=${MUSA_FUSED_MLA_DOWN_PROJ:-1}
 export MUSA_NATIVE_ROPE=${MUSA_NATIVE_ROPE:-1}
 export MUSA_FUSED_MLA_ROPE=${MUSA_FUSED_MLA_ROPE:-1}
-for flag_name in MATE_GROUPED_GEMM MATE_USE_MAIN_GRAD MUTLASS_WGRAD MUTLASS_WGRAD_E32_K_GROUPED MATE_FLASH_ATTN MATE_CACHE_MUBIN_DISPATCH MATE_DEFER_DEEPEP_COUNTS MUSA_COMPACT_PERMUTE MUSA_FUSED_MLA_DOWN_PROJ MUSA_NATIVE_ROPE MUSA_FUSED_MLA_ROPE; do
+for flag_name in MATE_GROUPED_GEMM MATE_USE_MAIN_GRAD MATE_FLASH_ATTN MATE_CACHE_MUBIN_DISPATCH MATE_DEFER_DEEPEP_COUNTS MUSA_COMPACT_PERMUTE MUSA_FUSED_MLA_DOWN_PROJ MUSA_NATIVE_ROPE MUSA_FUSED_MLA_ROPE; do
     flag_value=${!flag_name}
     if [[ "${flag_value}" != "0" && "${flag_value}" != "1" ]]; then
         echo "Error: ${flag_name} must be 0 or 1, got '${flag_value}'" >&2
@@ -268,10 +265,6 @@ for flag_name in MATE_GROUPED_GEMM MATE_USE_MAIN_GRAD MUTLASS_WGRAD MUTLASS_WGRA
 done
 if [[ "${MATE_GROUPED_GEMM}" = "1" && "${MOE_GROUPED_GEMM}" != "1" ]]; then
     echo "Error: MATE_GROUPED_GEMM=1 requires MOE_GROUPED_GEMM=1" >&2
-    exit 2
-fi
-if [[ "${MUTLASS_WGRAD}" = "1" && ( "${MATE_GROUPED_GEMM}" != "1" || "${MATE_USE_MAIN_GRAD}" != "1" ) ]]; then
-    echo "Error: MUTLASS_WGRAD=1 requires MATE_GROUPED_GEMM=1 and MATE_USE_MAIN_GRAD=1" >&2
     exit 2
 fi
 if [[ "${MATE_GROUPED_GEMM}" = "1" || "${MATE_FLASH_ATTN}" = "1" ]]; then
@@ -530,8 +523,6 @@ echo "  PROFILER   : ${ENABLE_PROFILER:-0}"
 echo "  DEEPEP_ACE : ${USE_DEEPEP_ACE}"
 echo "  GROUP_GEMM : ${MOE_GROUPED_GEMM}"
 echo "  MATE_FD_TE_W: ${MATE_GROUPED_GEMM} (main_grad=${MATE_USE_MAIN_GRAD})"
-echo "  MUTLASS_WGRAD: ${MUTLASS_WGRAD} (guarded beta=1 only)"
-echo "  MUTLASS_E32_KGROUP: ${MUTLASS_WGRAD_E32_K_GROUPED} (4 experts/launch)"
 echo "  MATE_FA_FWD : ${MATE_FLASH_ATTN} (cache=${MATE_CACHE_MUBIN_DISPATCH})"
 echo "  COMPACT_PERM: ${MUSA_COMPACT_PERMUTE}"
 echo "  MLA_DOWN_FUSE: ${MUSA_FUSED_MLA_DOWN_PROJ}"
