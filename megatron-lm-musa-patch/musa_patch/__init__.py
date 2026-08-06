@@ -6,6 +6,22 @@ import torch.utils.data
 import torch_musa
 from contextlib import nullcontext
 
+# MATE must register its MUSA DLPack bridge before Transformer Engine imports
+# its TVM-FFI dependencies. Importing this helper is safe when the feature is
+# disabled; the optional ``mate`` package is loaded only for the opt-in path.
+#
+# NOTE the pod tree reads env_flag from mate_grouped_gemm and only takes this
+# branch as the `elif` of MATE_GROUPED_GEMM (which does the same registration).
+# mate_grouped_gemm is a separate, not-yet-migrated optimization, so the helper
+# is taken from mate_flash_attention here — it is the same strict 0/1 reader.
+# When MATE_GROUPED_GEMM lands, restore the if/elif so the bridge is registered
+# exactly once.
+from .mate_flash_attention import env_flag as _mate_env_flag
+from .mate_flash_attention import load_mate_flash_attention as _load_mate_flash_attention
+
+if _mate_env_flag("MATE_FLASH_ATTN", "1"):
+    _load_mate_flash_attention()
+
 def patch_before_import_megatron():
     # Import fused_layer_norm before transformer_engine
     from . import fused_layer_norm
@@ -231,5 +247,10 @@ if os.getenv("ENABLE_ZERO_BUBBLE", "0") == "1":
     zbb_light.patch_megatron()
 
 patch_before_import_megatron()
+
+if _mate_env_flag("MATE_FLASH_ATTN", "1"):
+    from .mate_flash_attention import install_mate_flash_attention
+
+    install_mate_flash_attention()
 
 
