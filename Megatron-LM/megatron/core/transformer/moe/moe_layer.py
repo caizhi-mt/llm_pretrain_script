@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Union
@@ -19,6 +20,29 @@ from megatron.core.transformer.moe.token_dispatcher import (
 )
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+
+_SHARED_EARLY_LOGGED = False
+
+
+def _shared_expert_early_enabled() -> bool:
+    """Issue the shared expert before dispatch so it overlaps the a2a (env-gated).
+
+    NOTE: the confirmation log is NOT gated on RANK==0 -- with PP=16 the first
+    stage holds only dense layers and never reaches this code, so a rank-0-only
+    log would silently never appear.
+    """
+    global _SHARED_EARLY_LOGGED
+    on = os.environ.get("MOE_SHARED_EXPERT_EARLY", "0") == "1"
+    if on and not _SHARED_EARLY_LOGGED:
+        _SHARED_EARLY_LOGGED = True
+        print(
+            f"[shared-expert-early][rank{os.environ.get('RANK', '?')}] "
+            "issuing shared expert before dispatch",
+            flush=True,
+        )
+    return on
+
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -183,16 +207,42 @@ class MoELayer(BaseMoELayer):
         )
         return hidden_states, probs, residual
 
-    def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
+    def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor, previous_event=None):
         """Dispatches tokens to assigned expert ranks via communication.
         This method performs the actual communication (e.g., All-to-All) to distribute
         tokens and their associated probabilities to the devices hosting their assigned
         experts.
         """
+        if previous_event is not None:
+            # Only the flex/DeepEP dispatcher accepts this; other dispatchers keep
+            # their original signature.
+            return self.token_dispatcher.token_dispatch(
+                hidden_states, probs, previous_event=previous_event
+            )
         return self.token_dispatcher.token_dispatch(hidden_states, probs)
 
+    def _compute_shared_expert(self, residual: torch.Tensor):
+        """Run the shared expert (no-op when unused or handled by the dispatcher)."""
+        if not self.use_shared_expert or self.shared_expert_overlap:
+            return None
+        if self.shared_experts_recompute:
+            if self.config.fp8:
+                return te_checkpoint(
+                    self.shared_experts,
+                    False,
+                    tensor_parallel.random.get_cuda_rng_tracker,
+                    parallel_state.get_tensor_model_parallel_group(),
+                    residual,
+                )
+            return tensor_parallel.checkpoint(self.shared_experts, False, residual)
+        return self.shared_experts(residual)
+
     def experts_compute(
-        self, hidden_states: torch.Tensor, probs: torch.Tensor, residual: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        probs: torch.Tensor,
+        residual: torch.Tensor,
+        precomputed_shared_expert_output: torch.Tensor = None,
     ):
         """Computes the output of the experts on the dispatched tokens.
 
@@ -209,24 +259,9 @@ class MoELayer(BaseMoELayer):
             get_fine_grained_offload_handler().launch_offload('moe_fused_swiglu_input')
             hidden_states = WaitReloadFunction.apply(hidden_states, 'moe_fused_swiglu_input')
         
-        shared_expert_output = None
-        if self.use_shared_expert and not self.shared_expert_overlap:
-            # Compute the shared expert separately when not overlapped with communication.
-            if self.shared_experts_recompute:
-                if self.config.fp8:
-                    shared_expert_output = te_checkpoint(
-                        self.shared_experts,
-                        False,
-                        tensor_parallel.random.get_cuda_rng_tracker,
-                        parallel_state.get_tensor_model_parallel_group(),
-                        residual,
-                    )
-                else:
-                    shared_expert_output = tensor_parallel.checkpoint(
-                        self.shared_experts, False, residual
-                    )
-            else:
-                shared_expert_output = self.shared_experts(residual)
+        shared_expert_output = precomputed_shared_expert_output
+        if shared_expert_output is None:
+            shared_expert_output = self._compute_shared_expert(residual)
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
@@ -280,9 +315,29 @@ class MoELayer(BaseMoELayer):
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states):
             hidden_states, probs, residual = self.router_and_preprocess(hidden_states)
-            dispatched_input, probs = self.dispatch(hidden_states, probs)
+            # MOE_SHARED_EXPERT_EARLY: issue the shared expert BEFORE dispatch.
+            # DeepEP's fused_dispatch must return num_recv_tokens_per_expert_list as
+            # host data, so the CPU blocks inside dispatch() until the all-to-all
+            # completes.  Enqueuing the shared expert first leaves work on the compute
+            # stream for the GPU to run while the CPU is blocked, letting the shared
+            # expert overlap the dispatch a2a.  The shared expert only needs `residual`
+            # (produced by router_and_preprocess), so there is no data dependency.
+            early_shared_expert_output = None
+            dispatch_event = None
+            if _shared_expert_early_enabled():
+                # Record compute-stream progress BEFORE enqueuing the shared expert.
+                # DeepEP's default bare EventHandle() captures "everything enqueued so
+                # far", which would make the a2a wait for the shared expert too and
+                # defeat the overlap entirely (measured: zero gain).  The a2a only
+                # depends on router_and_preprocess output, already enqueued here.
+                from megatron.core.transformer.moe.fused_a2a import make_dispatch_event
+
+                if make_dispatch_event is not None:
+                    dispatch_event = make_dispatch_event()
+                early_shared_expert_output = self._compute_shared_expert(residual)
+            dispatched_input, probs = self.dispatch(hidden_states, probs, dispatch_event)
             output, shared_expert_output, mlp_bias = self.experts_compute(
-                dispatched_input, probs, residual
+                dispatched_input, probs, residual, early_shared_expert_output
             )
             output = self.combine(output, shared_expert_output)
             return output, mlp_bias

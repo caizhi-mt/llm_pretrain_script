@@ -999,6 +999,7 @@ class _DeepepManager(_DispatchManager):
         hidden_states: torch.Tensor,
         async_finish: bool = False,
         allocate_on_comm_stream: bool = False,
+        previous_event=None,
     ) -> torch.Tensor:
         # DeepEP only supports float32 probs
         if self.token_probs.dtype != torch.float32:
@@ -1014,6 +1015,7 @@ class _DeepepManager(_DispatchManager):
                 self.group,
                 async_finish=async_finish,
                 allocate_on_comm_stream=allocate_on_comm_stream,
+                previous_event=previous_event,
             )
         )
         self.handle = handle
@@ -1150,6 +1152,84 @@ class _DeepepManager(_DispatchManager):
         return hidden_states
 
 
+_SE_DISPATCH_EVENT_LOGGED = False
+
+
+def _se_dispatch_event_enabled():
+    """env: MOE_SE_DISPATCH_EVENT=1 -- capture previous_event before the shared expert.
+
+    NOTE deliberately not gated on RANK==0: PP stage 0 holds only dense layers and
+    never runs MoE code, so a rank-0 gate makes the log never appear.
+    """
+    global _SE_DISPATCH_EVENT_LOGGED
+    on = os.environ.get("MOE_SE_DISPATCH_EVENT", "0") == "1"
+    if on and not _SE_DISPATCH_EVENT_LOGGED:
+        _SE_DISPATCH_EVENT_LOGGED = True
+        print("[se-dispatch-event] ENABLED: a2a no longer waits for shared-expert fc1",
+              flush=True)
+    return on
+
+
+_SE_LATE_ISSUE_LOGGED = False
+
+
+def _se_late_issue_level():
+    """env: MOE_SE_LATE_ISSUE -- 0 off, 1 fc1 only, 2 fc1+fc2.
+
+    Two levels because the two halves have very different expected value:
+      * fc1 is the half with upside.  It currently lands on the dispatch metadata
+        phase instead of the payload.
+      * fc2 is the risky half.  It currently runs under the expert grouped GEMM
+        (~10ms on the compute stream) and is therefore already fully hidden and
+        costing nothing; moving it onto the combine payload cannot free time it was
+        not spending, and it puts fc2 in front of get_output().  Level 2 exists to
+        measure that, not because it is expected to win.
+
+    Budget from the rank32 iteration-6 trace, counting only shared-expert work that
+    runs while NO other stream does (i.e. actually on the critical path, so moving it
+    under the a2a would shorten wall clock): 119.9ms forward + 201.3ms backward =
+    346.4ms of a 34.8s span -> a 1.00% ceiling overall, 0.34% for forward.  True
+    whole-GPU idle is 1.46%, so this is a reordering gain, not new throughput.
+    """
+    v = os.environ.get("MOE_SE_LATE_ISSUE", "0")
+    return 2 if v == "2" else (1 if v == "1" else 0)
+
+
+def _se_late_issue_enabled():
+    """env: MOE_SE_LATE_ISSUE>=1 -- issue fc1 after the a2a call instead of before.
+
+    ``token_dispatch`` blocks the CPU only until ``ace_notify_dispatch`` completes (it
+    needs num_recv_tokens as host data); the D2D payload is enqueued right before the
+    call returns and is still in flight afterwards.  Measured on rank32 iteration 6:
+    the FusedDispatch cpu_op ends at +18296us while the payload runs +18365..+20183us.
+
+    So issuing the shared expert *before* the call makes it land on the metadata phase,
+    not the payload: fc1 starts a median 2.9ms before the payload and has already
+    finished 1.4ms before it begins, and fc2 lands a median 17.2ms before the combine
+    it was meant to cover.  Forward coverage of the payload is 0% (metadata 20%),
+    against 24% in backward.
+
+    Issuing after the call needs no explicit event -- the CPU block *is* the
+    synchronisation, since a stream cannot start work the host has not enqueued yet.
+
+    NOTE deliberately not gated on RANK==0: PP stage 0 holds only dense layers and
+    never runs MoE code, so a rank-0 gate makes the log never appear.
+    """
+    global _SE_LATE_ISSUE_LOGGED
+    level = _se_late_issue_level()
+    if level and not _SE_LATE_ISSUE_LOGGED:
+        _SE_LATE_ISSUE_LOGGED = True
+        print(f"[se-late-issue] ENABLED level={level}: fc1 issued in "
+              f"dispatch_postprocess" + (", fc2 in combine_postprocess" if level >= 2
+                                         else " (fc2 unchanged)"), flush=True)
+    return level >= 1
+
+
+def _se_late_fc2_enabled():
+    """True when fc2 also moves to combine_postprocess (MOE_SE_LATE_ISSUE=2)."""
+    return _se_late_issue_level() >= 2
+
+
 class MoEFlexTokenDispatcher(MoETokenDispatcher):
     """A flexible token dispatcher that abstracts the underlying tensor and expert
     parallelism. It uses a single communication group over all TP and EP ranks,
@@ -1192,9 +1272,23 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         )
 
     def set_shared_experts(self, shared_experts):
-        raise NotImplementedError(
-            "Shared expert overlap is not supported in Flex Token Dispatcher."
-        )
+        """Enable shared-expert / communication overlap for the DeepEP path.
+
+        The shared expert runs on its own stream (SharedExpertMLP.stream), staged so
+        that fc1 covers the dispatch a2a and fc2 covers the combine a2a.
+
+        NOTE the stage placement differs from MoEAlltoAllTokenDispatcher:
+          * alltoall's ``token_dispatch`` launches an async a2a and returns, so it can
+            issue fc1 in ``dispatch_postprocess`` (i.e. after the launch).
+          * DeepEP's ``token_dispatch`` BLOCKS the CPU until the a2a completes, because
+            fused_dispatch must return num_recv_tokens_per_expert_list as host data.
+            Issuing fc1 after it would cover nothing, so fc1 goes in
+            ``dispatch_preprocess`` -- before the blocking call.
+          * likewise fc2 goes in ``combine_preprocess`` (before token_combine) rather
+            than in ``combine_postprocess``, which here only reshapes and would leave
+            no main-stream work to overlap before get_output() joins the streams.
+        """
+        self.shared_experts = shared_experts
 
     def _initialize_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
         """
@@ -1247,6 +1341,41 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         routing_map, probs = self._initialize_metadata(routing_map, probs)
 
         self._comm_manager.setup_metadata(routing_map, probs)
+
+        self._se_dispatch_event = None
+        if getattr(self, "shared_experts", None) is not None:
+            # Record the compute stream's progress BEFORE enqueuing the shared expert.
+            #
+            # fused_dispatch does `if previous_event is None: previous_event =
+            # EventOverlap(EventHandle())` (fused_a2a.py), i.e. it records the event
+            # itself at dispatch time -- which by then also covers the shared expert we
+            # just enqueued, so DeepEP's comm stream waits for fc1 before starting the
+            # a2a.  Measured on rank32: 256 gaps after `get_dispatch_layout`, median
+            # 1.17 ms, 211.2 ms total (0.61% of the window), each gap ending exactly
+            # when the shared-expert fc1 (GEMM + SwiGlu) ends.
+            #
+            # It is a dependency, not a hardware limit: the same two streams do run
+            # concurrently for 491.8 ms elsewhere in the same trace.  The a2a only truly
+            # depends on x / token_indices / token_probs, all of which are ready here,
+            # so an event recorded at this point is still a correct dependency.
+            if _se_dispatch_event_enabled():
+                from megatron.core.transformer.moe.fused_a2a import make_dispatch_event
+
+                if make_dispatch_event is not None:
+                    self._se_dispatch_event = make_dispatch_event()
+
+            # Caches the fc1 input and makes the shared stream wait on the compute
+            # stream.  Cheap (identity without TP/SP) and must see hidden_states in its
+            # original shape, so it stays here under both issue policies.
+            self.shared_experts.pre_forward_comm(hidden_states.view(self.hidden_shape))
+
+            # Issue the shared expert's fc1 on its own stream BEFORE the blocking
+            # DeepEP dispatch, so the GPU has independent work while the a2a runs.
+            # Under MOE_SE_LATE_ISSUE this moves to dispatch_postprocess, where the
+            # payload is actually in flight -- see _se_late_issue_enabled().
+            if not _se_late_issue_enabled():
+                self.shared_experts.linear_fc1_forward_and_act()
+
         return hidden_states, self._comm_manager.token_probs
 
     def token_dispatch(
@@ -1255,6 +1384,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         probs: torch.Tensor = None,
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
+        previous_event=None,
     ):
         """
         Execute fused permutation and AlltoAll communication.
@@ -1273,8 +1403,17 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         Returns:
             A tuple of dispatched tokens and probabilities.
         """
+        if previous_event is None:
+            # Event captured in dispatch_preprocess, before the shared expert was
+            # enqueued -- keeps the a2a from waiting on fc1.  None when the shared
+            # expert is not owned by this dispatcher or the switch is off, in which
+            # case fused_dispatch records its own event as before.
+            previous_event = getattr(self, "_se_dispatch_event", None)
+
         return (
-            self._comm_manager.dispatch(hidden_states, async_finish, allocate_on_comm_stream),
+            self._comm_manager.dispatch(
+                hidden_states, async_finish, allocate_on_comm_stream, previous_event
+            ),
             self._comm_manager.dispatched_probs,
         )
 
@@ -1291,10 +1430,30 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         Returns:
             A tuple of permuted tokens, token counts per expert, and permuted probabilities.
         """
+        if getattr(self, "shared_experts", None) is not None and _se_late_issue_enabled():
+            # token_dispatch has returned, so the D2D payload is enqueued and in flight
+            # while the CPU is here -- this is where fc1 actually covers it.  Issue it
+            # before get_permuted_hidden_states_by_experts(), whose permute is compute
+            # -stream work that has to wait for that same payload.
+            self.shared_experts.linear_fc1_forward_and_act()
+
         global_input_tokens, permuted_probs = (
             self._comm_manager.get_permuted_hidden_states_by_experts(hidden_states)
         )
         tokens_per_expert = self._comm_manager.get_number_of_tokens_per_expert()
+
+        if getattr(self, "shared_experts", None) is not None:
+            # Backward-side overlap.  fc1 was issued in dispatch_preprocess (before the
+            # blocking dispatch), so unlike the alltoall path there was no comm-output
+            # tensor to hand to linear_fc1_forward_and_act().  Boost it here instead:
+            # raising the dispatch output's grad_fn sequence_nr makes the autograd engine
+            # pop the dispatch backward first, so the shared expert's backward -- which
+            # runs on its own stream -- overlaps it rather than queuing behind it.
+            from megatron.core.transformer.moe.shared_experts import (
+                set_tensor_grad_fn_sequence_sr,
+            )
+
+            set_tensor_grad_fn_sequence_sr(global_input_tokens, torch.iinfo(torch.int).max)
 
         # EP balance info collect
         if os.environ.get('EP_BALANCE_INFO', '0') == '1':
@@ -1316,6 +1475,16 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         by using the communication manager's restoration function.
         """
         hidden_states = self._comm_manager.get_restored_hidden_states_by_experts(hidden_states)
+
+        if getattr(self, "shared_experts", None) is not None and not _se_late_fc2_enabled():
+            # Issue fc2 before token_combine so it overlaps the combine a2a.
+            # Measured: it lands a median 17.2ms too early -- the expert grouped GEMM
+            # still sits between here and the combine.  MOE_SE_LATE_ISSUE=2 moves it to
+            # combine_postprocess instead.  Note that landing early is not itself a
+            # cost: fc2 runs under that grouped GEMM and is fully hidden either way.
+            self.shared_experts.linear_fc2_forward(hidden_states)
+            self.shared_experts.post_forward_comm()
+
         return hidden_states
 
     def token_combine(
@@ -1351,4 +1520,20 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         Returns:
             The final MoE layer output reshaped to its original dimensions.
         """
-        return hidden_states.view(self.hidden_shape)
+        if getattr(self, "shared_experts", None) is not None and _se_late_fc2_enabled():
+            # token_combine does not block the CPU (its cpu_op is ~200us against a
+            # ~2.9ms gpu span), so its payload is in flight right here.  Issuing fc2
+            # now puts it on top of that payload; get_output() below then waits on the
+            # shared stream, and fc2 (~1.4ms) is shorter than the payload it covers.
+            #
+            # hidden_states is the combine output, matching what the alltoall path hands
+            # to linear_fc2_forward: raising ITS grad_fn sequence_nr is what makes the
+            # autograd engine pop the combine backward before the shared expert's.
+            self.shared_experts.linear_fc2_forward(hidden_states)
+            self.shared_experts.post_forward_comm()
+
+        output = hidden_states.view(self.hidden_shape)
+        if getattr(self, "shared_experts", None) is not None:
+            # get_output() joins the shared-expert stream back into the current one.
+            output = output + self.shared_experts.get_output()
+        return output
