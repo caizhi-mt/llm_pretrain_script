@@ -268,6 +268,38 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# MUSA_CPU_AFFINITY=1 -> 按 local rank 绑核
+#   MUSA_CPU_AFFINITY_MAP 用 ';' 分隔,第 i 段是 local rank i 的 CPU 集合,
+#   段内是 ','/'-' 的常规写法(如 0-7,16)。
+#
+#   MODE=mate(默认)-> 只绑【提交 MATE 工作的那个 Python 线程】,且是在
+#     DeepEP 建好通信资源之后才绑(绑定点在 mate_grouped_gemm.py 的
+#     _MateGroupedLinear.forward 里),所以通信线程保留不受限的亲和性。
+#     ⚠ 因此 mate 模式只在 MATE_GROUPED_GEMM=1 时才真的会绑核。
+#   MODE=early -> 在 import torch 之前绑(musa_patch/__init__.py 顶部),
+#     之后创建的所有线程都继承该亲和性。标注为 experimental。
+#
+#   注意它不是"静默回退"型开关:请求的 CPU 不在本进程 cpuset 内、
+#   MAP 段数不够 LOCAL_RANK、或绑完校验不一致,都会直接抛异常。
+#   MODE 只接受 early|mate,MUSA_CPU_AFFINITY 只接受 0|1,其余值 raise。
+#
+#   MAP 的取值是【机器相关】的,默认留空,由入口脚本按实际拓扑给。
+#   本集群实测拓扑见 cluster/dist_train_caizhi.sh 的注释。
+# ---------------------------------------------------------------------------
+export MUSA_CPU_AFFINITY=${MUSA_CPU_AFFINITY:-0}
+export MUSA_CPU_AFFINITY_MODE=${MUSA_CPU_AFFINITY_MODE:-mate}
+export MUSA_CPU_AFFINITY_MAP=${MUSA_CPU_AFFINITY_MAP-}
+if [ "${MUSA_CPU_AFFINITY}" = "1" ]; then
+    if [ -z "${MUSA_CPU_AFFINITY_MAP}" ]; then
+        echo "Error: MUSA_CPU_AFFINITY=1 需要 MUSA_CPU_AFFINITY_MAP" >&2
+        exit 2
+    fi
+    echo "[cpu-affinity] ENABLED mode=${MUSA_CPU_AFFINITY_MODE} map=${MUSA_CPU_AFFINITY_MAP}"
+else
+    echo "[cpu-affinity] disabled"
+fi
+
+# ---------------------------------------------------------------------------
 # MATE_GROUPED_GEMM=1 -> MoE expert 的 BF16 GroupedLinear 走 MATE
 #   fprop/dgrad: MATE ragged-M GroupGEMM
 #   wgrad:       仍是一次 TE grouped GEMM,但直写 FP32 main_grad
