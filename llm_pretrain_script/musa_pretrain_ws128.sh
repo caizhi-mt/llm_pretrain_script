@@ -127,28 +127,44 @@ if [ ! -d "${MCORE_PATH}/build" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 并行策略（对齐 cuda_pretrain.sh；128×8=1024 = 2×8×1×64×1）
-# A-006 已修 SP arity；2026-07-13 128×10 step 验证通过 → 默认改回 TP=2 + SP
-# 前置：节点 /home/megatron-lm-musa-patch/.../linear_with_grad_...py SP return 须为 9 元组
+# 并行策略（512 卡实测最优：512 = TP1 × PP16 × CP1 × DP32，EP8）
+#
+# TP=1：MLA + MoE 下 TP 切分收益为负——TP>1 需要 all-reduce/all-gather，而本机
+#       MCCL kernel 与计算 kernel 实测零并发，通信时间全额落在关键路径上。
+# PP=16：61 层切 16 段，配合下方 decoder-first=3 / last=2 的非均匀切分。
+# EP=8：DeepEP 在 EP>8 时跨节点 dispatch 必崩，EP≤8 走 intranode 才可用；
+#       EP 增大也不省显存（MoE 静态权重占 77.7/80 GB 的结构性约束不变）。
+# CP=1：seq4096 无需上下文并行。
+# SP=0：TP=1 时 sequence-parallel 无意义（下方分支要求 TP>1 才会加该参数），
+#       显式置 0 以免误开。
+#
+# A-006 已修 SP arity；前置：节点 megatron-lm-musa-patch/.../
+# linear_with_grad_...py 的 SP return 须为 9 元组（TP>1 时才涉及）
 # ---------------------------------------------------------------------------
-TP=2
-PP=8
+TP=1
+PP=16
 CP=1
-EP=64
+EP=8
 MTP_LAYERS=0
 MTP_LOSS=0.1
-ENABLE_SEQUENCE_PARALLEL=${ENABLE_SEQUENCE_PARALLEL:-1}
-# cuda LAYOUT Et|(tt|)*30L：128 全宽挂死（A-004），生产用 decoder-first/last 7+6
+ENABLE_SEQUENCE_PARALLEL=${ENABLE_SEQUENCE_PARALLEL:-0}
+# cuda LAYOUT Et|(tt|)*30L：128 全宽挂死（A-004），生产用 decoder-first/last 3+2
 
 # ---------------------------------------------------------------------------
 # 训练超参（与 cuda_pretrain.sh 对齐，可通过环境变量覆盖）
 # ---------------------------------------------------------------------------
-MICRO_BATCH=1
+# MICRO_BATCH 直接线性缩放 1F1B 在途激活：stage1 峰值 ≈ 4 层 × 15 microbatch ×
+# 单层单 mb 激活；MBS=2 时 261 GiB，MBS=1 时 131 GiB。关重计算前必须先降到 1。
+MICRO_BATCH=${MICRO_BATCH:-2}
 GLOBAL_BATCH=${GLOBAL_BATCH:-$((NNODES * 128))}
 SEQ_LENGTH=${SEQ_LENGTH:-4096}                                         # 对齐 cuda / g2_128
+# 重计算粒度：full = 每层整层重算（method/num-layers 生效）
+#             selective = 只重算指定模块（method/num-layers 忽略）
+# full 是被逼的，不是选出来的：block/N 与 selective 全部实测 OOM。selective 即使
+# 挤进去也是余量≈0，而余量<1GB 会掉约 3% 吞吐，恰好抵消其收益。
 RECOMPUTE_GRANULARITY=${RECOMPUTE_GRANULARITY:-full}                   # cuda 无；MUSA seq4096 必需
-RECOMPUTE_METHOD=${RECOMPUTE_METHOD:-uniform}
-RECOMPUTE_NUM_LAYERS=${RECOMPUTE_NUM_LAYERS:-1}
+RECOMPUTE_METHOD=${RECOMPUTE_METHOD:-uniform}                          # 回退：block/N 显存不可行
+RECOMPUTE_NUM_LAYERS=${RECOMPUTE_NUM_LAYERS:-1}                        # 回退：全部重算
 DECAY_STEPS=100000
 TRAINING_STEPS=${TRAINING_STEPS:-100000}
 SAVE_INTERVAL=100000
@@ -177,8 +193,8 @@ DATA_PATH=${DATA_PATH:-/home/jd/wangkang/llm_pretrain/data/tkn_ds_the_pile}
 # 模型结构（MoE + MLA，对齐 cuda_pretrain.sh；MUSA 暂不能启用的 flag 见行内注释）
 # ---------------------------------------------------------------------------
 ADD_NETWORK_SIZE_ARGS=(
-    --decoder-first-pipeline-num-layers 7
-    --decoder-last-pipeline-num-layers 6
+    --decoder-first-pipeline-num-layers 3
+    --decoder-last-pipeline-num-layers 2
     --recompute-granularity ${RECOMPUTE_GRANULARITY}
     --recompute-method ${RECOMPUTE_METHOD}
     --recompute-num-layers ${RECOMPUTE_NUM_LAYERS}
