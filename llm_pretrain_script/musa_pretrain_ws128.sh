@@ -351,6 +351,20 @@ ADD_NETWORK_SIZE_ARGS=(
     --moe-permute-fusion
     --moe-router-force-load-balancing
     ${SHARED_EXPERT_OVERLAP_ARG}
+    # router 的 topk / sigmoid / group-limited-topk / aux-loss 打分融合成 TE kernel
+    # （对齐 musa_pretrain_worldsize512_caizhi.sh L592）。
+    #
+    # 硬前提，两条缺一不可：
+    #   1) 装的 TE 必须带 transformer_engine/pytorch/router.py（摩尔线程自编译
+    #      wheel 有，镜像自带的 2.0.0+e8a0a52 没有）；
+    #   2) pretrain_gpt_musa_launcher.py 里的 router-fusion 注入段必须生效——
+    #      Megatron 用 is_te_min_version("2.7.0.dev") 卡这三个融合符号，而 musa
+    #      TE 版本号是 2.0.0，过不了门，符号被置 None。
+    # 两者任一不满足，router 前向会抛
+    #   ValueError: fused_topk_with_score_function is not available.
+    # 它不会静默回退到非融合实现。回退办法是注释掉下面这行（或 ROUTER_FUSION_BYPASS=0
+    # 只关注入段——那样反而会踩上面的 ValueError，不要这么用）。
+    --moe-router-fusion
 )
 # GroupGEMM（对齐 examples 各模型脚本的使能方式，即 --moe-grouped-gemm 参数）:
 # MOE_GROUPED_GEMM=1（默认，原行为）→ 专家计算走 GroupedMLP
@@ -386,8 +400,9 @@ if [ "${ENABLE_SEQUENCE_PARALLEL}" = "1" ] && [ "${TP}" -gt 1 ]; then
 fi
 # 未启用（见 docs/musa_cuda_adaptation_issues.md）:
 #   --pipeline-model-parallel-layout / overlap / delay-wgrad /
-#   --moe-router-fusion / --moe-shared-expert-compute-before-router
+#   --moe-shared-expert-compute-before-router
 # flex+deepep+ACE / --enable-experimental 已随 USE_DEEPEP_ACE=1 接入（见上方 dispatcher 分支）
+# --moe-router-fusion 已启用（见上方 ADD_NETWORK_SIZE_ARGS，依赖 launcher 注入段）
 
 if [ "${NNODES}" -lt 128 ]; then
     echo "WARNING: musa_pretrain_ws128.sh 预期 NNODES>=128，当前 NNODES=${NNODES}" >&2

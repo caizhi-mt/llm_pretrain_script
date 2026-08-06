@@ -49,6 +49,50 @@ if os.getenv("ACCELERATOR_BACKEND", "musa") == "musa":
 
     musa_training.training_log = _training_log_core_compat
 
+# ---------------------------------------------------------------------------
+# MoE router fusion: 绕过 Megatron 的 TE 版本门
+#
+# megatron/core/extensions/transformer_engine.py:1950 用
+# is_te_min_version("2.7.0.dev") 决定要不要 import fused router 符号。摩尔线程
+# 的 TE fork 已经实现了这套 API（transformer_engine/pytorch/router.py），但版本
+# 号仍是 2.0.0，过不了这道门，三个符号被置成 None，运行到 router 前向时报
+#     ValueError: fused_topk_with_score_function is not available.
+#
+# 不改 VERSION.txt 是因为那会连带打开 2.2~2.7 区间的另外约 22 处版本门，
+# 引入一堆无关的未知数。这里只把这三个名字重新绑回去。
+#
+# ROUTER_FUSION_BYPASS=0 可关闭本段。
+# ---------------------------------------------------------------------------
+if os.getenv("ROUTER_FUSION_BYPASS", "1") == "1":
+    try:
+        from transformer_engine.pytorch.router import (
+            fused_compute_score_for_moe_aux_loss as _te_fused_score,
+            fused_moe_aux_loss as _te_fused_aux_loss,
+            fused_topk_with_score_function as _te_fused_topk,
+        )
+    except ImportError as _e:
+        print(f"[router-fusion] TE 无 pytorch.router，不做注入: {_e}", flush=True)
+    else:
+        import megatron.core.extensions.transformer_engine as _te_ext
+        from megatron.core.transformer.moe import moe_utils as _mu
+
+        _patched = []
+        for _mod in (_te_ext, _mu):
+            for _name, _fn in (
+                ("fused_topk_with_score_function", _te_fused_topk),
+                ("fused_compute_score_for_moe_aux_loss", _te_fused_score),
+                ("fused_moe_aux_loss", _te_fused_aux_loss),
+            ):
+                if getattr(_mod, _name, None) is None:
+                    setattr(_mod, _name, _fn)
+                    _patched.append(f"{_mod.__name__}.{_name}")
+        # moe_utils 的 fused 分支还会先看 HAVE_TE
+        if not getattr(_mu, "HAVE_TE", False):
+            _mu.HAVE_TE = True
+            _patched.append("moe_utils.HAVE_TE")
+        print(f"[router-fusion] 注入 {len(_patched)} 个符号: {_patched}", flush=True)
+
+
 mcore_path = os.environ.get("MCORE_PATH", "/home/Megatron-LM")
 pretrain_script = os.environ.get(
     "PRETRAIN_SCRIPT",
