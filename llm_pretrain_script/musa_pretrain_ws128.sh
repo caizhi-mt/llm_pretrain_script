@@ -329,6 +329,12 @@ fi
 # ---------------------------------------------------------------------------
 export MATE_GROUPED_GEMM=${MATE_GROUPED_GEMM:-0}
 export MATE_USE_MAIN_GRAD=${MATE_USE_MAIN_GRAD:-1}
+# MATE_DEFER_DEEPEP_COUNTS=1(默认)-> DeepEP 的 counts 先留在 CPU,device counts
+#   由 musa_patch 从 routing map 推出来。在 fused_a2a 里直接建 device tensor 会
+#   卡在 ACE dispatch 流后面,而此时独立的 shared-expert GEMM 还没提交;推迟之后
+#   连这次 H2D 拷贝本身也省了。置 0 回退原来的同步构造。
+#   只在 MATE_GROUPED_GEMM=1 时才有意义(外层门在 fused_a2a.py 里)。
+export MATE_DEFER_DEEPEP_COUNTS=${MATE_DEFER_DEEPEP_COUNTS:-1}
 if [ "${MATE_GROUPED_GEMM}" = "1" ]; then
     echo "[mate-gemm] ENABLED (fprop/dgrad=MATE, wgrad=TE grouped GEMM, main_grad=${MATE_USE_MAIN_GRAD})"
 else
@@ -362,7 +368,7 @@ fi
 export MATE_FLASH_ATTN=${MATE_FLASH_ATTN:-0}
 # MUBIN 元数据缓存(mate_flash_attention.py 读取,代码内默认 1)。
 export MATE_CACHE_MUBIN_DISPATCH=${MATE_CACHE_MUBIN_DISPATCH:-1}
-for flag_name in MATE_GROUPED_GEMM MATE_USE_MAIN_GRAD MATE_FLASH_ATTN MATE_CACHE_MUBIN_DISPATCH; do
+for flag_name in MATE_GROUPED_GEMM MATE_USE_MAIN_GRAD MATE_DEFER_DEEPEP_COUNTS MATE_FLASH_ATTN MATE_CACHE_MUBIN_DISPATCH; do
     flag_value=${!flag_name}
     if [[ "${flag_value}" != "0" && "${flag_value}" != "1" ]]; then
         echo "Error: ${flag_name} must be 0 or 1, got '${flag_value}'" >&2
