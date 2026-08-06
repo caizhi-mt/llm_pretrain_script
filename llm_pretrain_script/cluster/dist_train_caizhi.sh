@@ -32,6 +32,10 @@ export MUSA_FUSED_MLA_DOWN_PROJ=1
 #   注意 triton 不可用时是静默回退，换环境要确认 import triton 成功。
 export MUSA_COMPACT_PERMUTE=1
 
+# BF16 expert fast path（需要所有节点预装同版本 mate 与 mate-mubin）
+export MATE_GROUPED_GEMM=1       # fprop/dgrad=MATE, wgrad=TE grouped GEMM
+export MATE_USE_MAIN_GRAD=1      # wgrad 直写 FP32 main_grad, 避免 BF16 临时梯度和 add
+
 # MATE MLA FlashAttention 前向（实验37，移植 PR#2 a82e08c；musa_pretrain_ws128.sh 默认 0）
 #   +0.46%，但 iter1 grad norm 35.852 超出 35.66±0.03 判据 —— 这是本清单里
 #   唯一有真实精度代价的一项，用户确认"精度可放宽"后才开。不接受就置 0。

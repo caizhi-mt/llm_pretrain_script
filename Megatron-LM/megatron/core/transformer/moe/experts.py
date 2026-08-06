@@ -2,6 +2,7 @@
 
 import copy
 import itertools
+import os
 from copy import deepcopy
 from functools import partial, wraps
 from math import ceil
@@ -832,7 +833,36 @@ class TEGroupedMLP(MegatronModule):
         Return:
             output (torch.Tensor): The output of the local experts.
         """
-        tokens_per_expert = tokens_per_expert.tolist()
+        # Transformer Engine consumes host split sizes. MATE consumes an int32
+        # device tensor and also reuses DeepEP's original host metadata for TE
+        # wgrad, avoiding a device-to-host synchronization in the expert layer.
+        mate_counts = None
+        tokens_per_expert_list = None
+        if os.getenv('MATE_GROUPED_GEMM', '1') == '1':
+            if hasattr(tokens_per_expert, '_mate_m_splits'):
+                tokens_per_expert_list = list(tokens_per_expert._mate_m_splits)
+            else:
+                tokens_per_expert_list = tokens_per_expert.tolist()
+
+            if (
+                tokens_per_expert.device == permuted_local_hidden_states.device
+                and tokens_per_expert.dtype == torch.int32
+                and tokens_per_expert.is_contiguous()
+            ):
+                mate_counts = tokens_per_expert
+            else:
+                mate_counts = tokens_per_expert.to(
+                    device=permuted_local_hidden_states.device,
+                    dtype=torch.int32,
+                ).contiguous()
+            if not hasattr(mate_counts, '_mate_m_splits'):
+                mate_counts._mate_m_splits = tuple(tokens_per_expert_list)
+        else:
+            tokens_per_expert_list = tokens_per_expert.tolist()
+
+        grouped_gemm_splits = (
+            mate_counts if mate_counts is not None else tokens_per_expert_list
+        )
         if False and self.config.fp8:
             # TODO(yehua.zhang): musa groupgemm do not need to unpadding
             actual_tokens_per_expert = tokens_per_expert
@@ -856,7 +886,7 @@ class TEGroupedMLP(MegatronModule):
             permuted_probs = torch.ones_like(permuted_probs)
 
         intermediate_parallel, bias_parallel = self.linear_fc1(
-            permuted_local_hidden_states, tokens_per_expert,
+            permuted_local_hidden_states, grouped_gemm_splits,
             fine_grained_offload=self.config.offload_moe_fc1_input,
         )
 
@@ -888,7 +918,8 @@ class TEGroupedMLP(MegatronModule):
                             t + b
                             for t, b in zip(
                                 torch.split(
-                                    intermediate_parallel.view(-1, shape[-1]), tokens_per_expert
+                                    intermediate_parallel.view(-1, shape[-1]),
+                                    tokens_per_expert_list,
                                 ),
                                 bias_parallel,
                             )
@@ -918,13 +949,13 @@ class TEGroupedMLP(MegatronModule):
             intermediate_parallel = self.activation_checkpoint.checkpoint(
                 bias_act_func, intermediate_parallel, bias_parallel, permuted_probs
             )
-            output, output_bias = self.linear_fc2(intermediate_parallel, tokens_per_expert)
+            output, output_bias = self.linear_fc2(intermediate_parallel, grouped_gemm_splits)
             self.activation_checkpoint.discard_output_and_register_recompute(output)
         else:
             intermediate_parallel = bias_act_func(
                 intermediate_parallel, bias_parallel, permuted_probs
             )
-            output, output_bias = self.linear_fc2(intermediate_parallel, tokens_per_expert)
+            output, output_bias = self.linear_fc2(intermediate_parallel, grouped_gemm_splits)
 
         # upad and concat the output
         # TODO(yehua.zhang): musa groupgemm do not need to unpadding

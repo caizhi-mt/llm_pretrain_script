@@ -1,0 +1,694 @@
+"""MATE BF16 GroupedLinear fast path for MoE experts on MUSA.
+
+The patch keeps Transformer Engine's module, parameters, and state-dict
+format. MATE handles BF16 fprop and dgrad. Wgrad normally uses Transformer
+Engine; an optional guarded MP31 MUTLASS path accelerates benchmarked beta=1
+shapes. Both paths write directly into persistent FP32 ``main_grad``,
+avoiding a BF16 temporary and the subsequent BF16-to-FP32 accumulation pass.
+"""
+
+from __future__ import annotations
+
+import functools
+import os
+from pathlib import Path
+from typing import Sequence
+
+import torch
+
+
+def env_flag(name: str, default: str = "0") -> bool:
+    """Read a strict 0/1 environment flag."""
+    value = os.getenv(name, default)
+    if value not in {"0", "1"}:
+        raise ValueError(f"{name} must be 0 or 1, got {value!r}")
+    return value == "1"
+
+
+@functools.lru_cache(maxsize=1)
+def load_mate_gemm():
+    """Load MATE after torch_musa has registered its DLPack bridge."""
+    import torch_musa  # noqa: F401
+    from mate import gemm as mate_gemm
+
+    if env_flag("MATE_CACHE_MUBIN_DISPATCH", "1"):
+        try:
+            from mate.jit.mubin.gemm import dispatch, gemm_api
+
+            if _install_mubin_dispatch_cache(gemm_api, dispatch):
+                _log("MUBIN dispatch cache installed")
+        except (AttributeError, ImportError) as exc:
+            # MATE's private MUBIN API may change between releases. Keep the
+            # grouped GEMM path usable and make the missing optimization clear.
+            _log(f"MUBIN dispatch cache unavailable: {exc}")
+
+    return mate_gemm
+
+
+def _install_mubin_dispatch_cache(gemm_api, dispatch) -> bool:
+    """Cache immutable MATE MUBIN dispatch state, never tensors or routing counts.
+
+    MATE 0.2.5 rebuilds ``MoeGemmMubinDispatcher`` and re-verifies the selected
+    kernel artifact for every ragged-M call. It also recomputes the MUBIN id
+    hash and resolves the same module directory and kernel path on every call.
+
+    The selected ``GemmMubinId`` is immutable and already contains every field
+    that changes the kernel variant, including dtype, layout, MP architecture,
+    and the block selected from the current ragged-M shape. Cache by that id,
+    while continuing to pass the current M and routing counts to every launch.
+    """
+    if getattr(gemm_api, "_megatron_mubin_dispatch_cache_installed", False):
+        return False
+
+    original_dispatcher = gemm_api.MoeGemmMubinDispatcher
+    original_ensure_kernel = dispatch.ensure_mubin_kernel_artifact
+    original_ensure_module = getattr(gemm_api, "ensure_mubin_module_artifacts", None)
+
+    if callable(original_ensure_module):
+
+        @functools.lru_cache(maxsize=None)
+        def _default_module_dir(module: str):
+            return original_ensure_module(module)
+
+        def cached_ensure_module(module, cache_dir=None, repository=None):
+            # The packaged training path always uses the immutable default
+            # artifact location. Preserve MATE's behavior for explicit or
+            # potentially mutable repositories.
+            if cache_dir is not None or repository is not None:
+                return original_ensure_module(
+                    module, cache_dir=cache_dir, repository=repository
+                )
+            return _default_module_dir(str(module))
+
+        gemm_api.ensure_mubin_module_artifacts = cached_ensure_module
+
+    @functools.lru_cache(maxsize=None)
+    def _dispatcher_for_path(kernel_map_path: str):
+        dispatcher_instance = original_dispatcher(Path(kernel_map_path))
+        original_resolve_kernel_path = getattr(
+            dispatcher_instance, "resolve_kernel_path", None
+        )
+        if not callable(original_resolve_kernel_path):
+            return dispatcher_instance
+
+        @functools.lru_cache(maxsize=None)
+        def _resolved_kernel_path(asm_id, mubin_dir: str):
+            # MATE's resolver only uses ``args`` through ``get_asm_id(args)``.
+            # Supplying the already-computed immutable id keeps its lookup,
+            # validation, and error behavior intact on a cache miss.
+            return original_resolve_kernel_path(
+                None,
+                lambda _unused_args: asm_id,
+                Path(mubin_dir),
+            )
+
+        def cached_resolve_kernel_path(args, get_asm_id, mubin_dir):
+            asm_id = get_asm_id(args)
+            try:
+                hash(asm_id)
+            except TypeError:
+                # Keep compatibility with a future MATE version that returns
+                # a mutable dispatch id.
+                return original_resolve_kernel_path(args, get_asm_id, mubin_dir)
+            return _resolved_kernel_path(asm_id, str(Path(mubin_dir)))
+
+        dispatcher_instance.resolve_kernel_path = cached_resolve_kernel_path
+        dispatcher_instance._megatron_resolution_cache_installed = True
+        return dispatcher_instance
+
+    def cached_dispatcher(kernel_map_path):
+        return _dispatcher_for_path(str(Path(kernel_map_path)))
+
+    @functools.lru_cache(maxsize=None)
+    def _verified_kernel(module: str, module_dir: str, kernel_file_name: str):
+        return original_ensure_kernel(module, Path(module_dir), kernel_file_name)
+
+    def cached_ensure_kernel(module, module_dir, kernel_file_name, repository=None):
+        # Custom repositories may be mutable or non-hashable. They are not used
+        # by the packaged mate-mubin path, so preserve original semantics.
+        if repository is not None:
+            return original_ensure_kernel(
+                module, module_dir, kernel_file_name, repository=repository
+            )
+        return _verified_kernel(str(module), str(Path(module_dir)), str(kernel_file_name))
+
+    gemm_api.MoeGemmMubinDispatcher = cached_dispatcher
+    dispatch.ensure_mubin_kernel_artifact = cached_ensure_kernel
+    gemm_api._megatron_mubin_dispatch_cache_installed = True
+    return True
+
+
+def _rank() -> int:
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank()
+    except Exception:
+        pass
+    return int(os.getenv("RANK", "0"))
+
+
+def _log(message: str) -> None:
+    """Print a MATE path message.
+
+    NOTE: the rank-0 gate was removed on purpose.  With PP=16 rank 0 holds only
+    the dense layers and never executes the MoE grouped GEMM backward, so a
+    rank-0 gate makes every MUTLASS decision/kernel log silently invisible --
+    including on ranks 480-511 (last PP stage), which are exactly the ones that
+    fail with "DeepEP CPU recv timeout".  Prefix with the rank and grep sort -u.
+    """
+    print(f"[MATE_GROUPED_GEMM][rank{os.getenv('RANK', '?')}] {message}", flush=True)
+
+
+class _MateGroupedLinear(torch.autograd.Function):
+    """MATE ragged-M fprop/dgrad with Transformer Engine grouped wgrad."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        inp: torch.Tensor,
+        counts: torch.Tensor,
+        use_main_grad: bool,
+        is_first_microbatch: bool | None,
+        *weights: torch.Tensor,
+    ):
+        # In ``mate`` affinity mode this binds only the Python thread that
+        # submits MATE work. DeepEP/communication threads were created before
+        # this point and retain their unrestricted affinity.
+        from .cpu_affinity import maybe_bind_local_rank_cpu_affinity
+
+        maybe_bind_local_rank_cpu_affinity("mate")
+        mate_gemm = load_mate_gemm()
+
+        in_features = weights[0].shape[-1]
+        out_features = weights[0].shape[0]
+        flat_inp = inp.reshape(-1, in_features).contiguous()
+        packed_weights = weights[0].as_strided(
+            (len(weights), out_features, in_features),
+            (out_features * in_features, in_features, 1),
+        )
+        out = torch.empty(
+            (flat_inp.shape[0], out_features),
+            dtype=flat_inp.dtype,
+            device=flat_inp.device,
+        )
+        with torch.profiler.record_function("mate_grouped_gemm_fprop"):
+            mate_gemm.ragged_m_moe_gemm_16bit(
+                flat_inp,
+                packed_weights,
+                counts,
+                out,
+                gemm_mode="per_expert",
+                major_a_mode="K",
+                major_b_mode="K",
+                backend="mubin",
+            )
+
+        ctx.inp_shape = inp.shape
+        ctx.use_main_grad = use_main_grad
+        ctx.is_first_microbatch = is_first_microbatch
+        ctx.m_splits = tuple(counts._mate_m_splits)
+
+        # --- Fine-grained activation offloading (NV upstream port) interop ---
+        # When --fine-grained-activation-offloading is on, an offload scope may be
+        # active around this call (e.g. offload_modules containing "expert_fc1").
+        # Its saved_tensors_hooks intercept everything passed to save_for_backward,
+        # move it to host memory, and hand back a *new* tensor on reload.  For the
+        # expert weights that breaks backward in two ways:
+        #   1. Megatron DDP attaches ``main_grad`` / ``grad_added_to_main_grad`` to
+        #      the Parameter; a reloaded tensor does not carry them
+        #      (-> AttributeError: 'Tensor' object has no attribute 'main_grad').
+        #   2. backward relies on all experts sharing ONE contiguous storage
+        #      (``weights[0].as_strided((num_experts, ...))``).  Reloaded tensors
+        #      are separate allocations, so that view would read out of bounds.
+        # Marking them opts out of the offload path (the checker honours
+        # ``_do_not_offload``); ctx.weight_refs additionally keeps the original
+        # objects so attribute access never depends on what saved_tensors returns.
+        for weight in weights:
+            try:
+                weight._do_not_offload = True
+            except AttributeError:  # pragma: no cover - exotic tensor subclasses
+                pass
+        ctx.weight_refs = weights
+
+        ctx.save_for_backward(flat_inp, counts, *weights)
+        return out.reshape(*inp.shape[:-1], out_features)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        mate_gemm = load_mate_gemm()
+
+        flat_inp, counts, *weights = ctx.saved_tensors
+        # Prefer the original weight objects (see the note in forward): they keep
+        # DDP's main_grad attributes and the shared packed storage even when an
+        # activation-offload scope was active around the forward call.
+        weights = list(getattr(ctx, "weight_refs", None) or weights)
+        grad_output = grad_output.reshape(-1, grad_output.shape[-1]).contiguous()
+        num_experts = len(weights)
+        out_features, in_features = weights[0].shape
+        packed_weights = weights[0].as_strided(
+            (num_experts, out_features, in_features),
+            (out_features * in_features, in_features, 1),
+        )
+
+        dgrad = None
+        if ctx.needs_input_grad[0]:
+            dgrad = torch.empty_like(flat_inp)
+            with torch.profiler.record_function("mate_grouped_gemm_dgrad"):
+                mate_gemm.ragged_m_moe_gemm_16bit(
+                    grad_output,
+                    packed_weights,
+                    counts,
+                    dgrad,
+                    gemm_mode="per_expert",
+                    major_a_mode="K",
+                    # Stored weights are [N, K]. dY[M, N] @ W[N, K]
+                    # therefore consumes the same storage in N-major mode.
+                    major_b_mode="N",
+                    backend="mubin",
+                )
+            dgrad = dgrad.reshape(ctx.inp_shape)
+
+        wgrads = [None] * num_experts
+        if any(ctx.needs_input_grad[4:]):
+            if ctx.use_main_grad:
+                wgrad_outputs = [weight.main_grad for weight in weights]
+                grad_added_flags = [
+                    getattr(weight, "grad_added_to_main_grad", None) for weight in weights
+                ]
+                if all(flag is not None for flag in grad_added_flags):
+                    if len({bool(flag) for flag in grad_added_flags}) != 1:
+                        raise RuntimeError(
+                            "Grouped expert weights disagree on main_grad accumulation state"
+                        )
+                    # Megatron DDP resets this flag at the beginning of every
+                    # optimizer iteration, so it is a reliable beta=0/beta=1
+                    # signal even when non-FP8 modules do not reset TE's
+                    # is_first_microbatch flag.
+                    accumulate = bool(grad_added_flags[0])
+                else:
+                    accumulate = (
+                        not ctx.is_first_microbatch
+                        if ctx.is_first_microbatch is not None
+                        else True
+                    )
+            else:
+                wgrad_outputs = [torch.empty_like(weight) for weight in weights]
+                accumulate = False
+
+            mutlass_kernel = None
+            if env_flag("MUTLASS_WGRAD", "0"):
+                from .mutlass_wgrad import can_use_mutlass_wgrad
+
+                mutlass_kernel = can_use_mutlass_wgrad(
+                    flat_inp,
+                    grad_output,
+                    ctx.m_splits,
+                    wgrad_outputs,
+                    use_main_grad=ctx.use_main_grad,
+                    accumulate=accumulate,
+                )
+                if env_flag("MUTLASS_WGRAD_DEBUG", "0"):
+                    _log_mutlass_decision(
+                        len(ctx.m_splits),
+                        flat_inp.shape[0],
+                        grad_output.shape[1],
+                        flat_inp.shape[1],
+                        min(ctx.m_splits),
+                        max(ctx.m_splits),
+                        ctx.use_main_grad,
+                        accumulate,
+                        flat_inp.is_contiguous(),
+                        grad_output.is_contiguous(),
+                        wgrad_outputs[0].dtype,
+                        wgrad_outputs[0].shape,
+                        wgrad_outputs[0].is_contiguous(),
+                        mutlass_kernel,
+                    )
+
+            # --- Optional MATE ragged-K wgrad (env: MATE_WGRAD_RAGGED_K=1) ---
+            # TE's general_grouped_gemm launches one GEMM per expert (8448 launches
+            # per iteration at PP16/EP8 in the production trace).  MATE's ragged-K
+            # kernel does the same math in a single grouped launch:
+            #     A = grad_output (sum_k, out_features)   -> m = out_features
+            #     B = flat_inp    (sum_k, in_features)    -> n = in_features
+            #     out            (num_experts, m, n)      -> packed main_grad
+            #     semantics: D = D + A^T B per expert  (== dY^T @ X == wgrad)
+            # Microbenchmarks at production shapes show the two are equivalent on
+            # an idle GPU (bitwise-identical results, +-2.5% time), but TE's
+            # 8448-launch pattern degrades far more under concurrent streams
+            # (median/min 51-101% vs MATE's 5-8%).  Production always has DeepEP
+            # memcpy and MCCL traffic in flight, so this is worth an A/B there.
+            #
+            # Requires the per-expert main_grads to be one contiguous block so we
+            # can view them as (num_experts, out_features, in_features); falls back
+            # to TE otherwise.  Never used for the non-main_grad path, whose
+            # outputs are separate empty_like tensors.
+            # NOTE gated on `mutlass_kernel is None`: MUTLASS (upstream) takes
+            # precedence, so the two paths can never both fire.
+            _want_mate_wgrad = mutlass_kernel is None and env_flag(
+                "MATE_WGRAD_RAGGED_K", "0"
+            )
+            use_mate_wgrad = (
+                _want_mate_wgrad
+                and ctx.use_main_grad
+                and wgrad_outputs[0].dtype == torch.float32
+                and _is_packed(wgrad_outputs)
+            )
+            if _want_mate_wgrad and not use_mate_wgrad:
+                # Explain the fallback once instead of silently using TE.
+                mg0 = wgrad_outputs[0]
+                elem = mg0.element_size()
+                span = mg0.numel() * elem
+                gaps = [
+                    (w.data_ptr() - mg0.data_ptr()) - i * span
+                    for i, w in enumerate(wgrad_outputs)
+                ]
+                _log_once(
+                    "wgrad: 回退 TE  "
+                    f"use_main_grad={ctx.use_main_grad} "
+                    f"dtype={wgrad_outputs[0].dtype} "
+                    f"packed={_is_packed(wgrad_outputs)} "
+                    f"contig={[bool(w.is_contiguous()) for w in wgrad_outputs[:3]]} "
+                    f"shape={tuple(mg0.shape)} span={span} "
+                    f"ptr_offsets_minus_ideal={gaps[:6]}"
+                )
+
+            if mutlass_kernel is not None:
+                from .mutlass_wgrad import mutlass_wgrad_accumulate
+
+                _log_mutlass_kernel(mutlass_kernel)
+                with torch.profiler.record_function(
+                    "mate_mutlass_grouped_gemm_wgrad_accumulate"
+                ):
+                    mutlass_wgrad_accumulate(
+                        flat_inp, grad_output, ctx.m_splits, wgrad_outputs
+                    )
+            elif use_mate_wgrad:
+                packed_wgrad = wgrad_outputs[0].as_strided(
+                    (num_experts, out_features, in_features),
+                    (out_features * in_features, in_features, 1),
+                )
+                # MATE always accumulates (D = D + A^T B).  TE's beta=0 case is
+                # expressed by zeroing the destination first.
+                if not accumulate:
+                    packed_wgrad.zero_()
+                with torch.profiler.record_function("mate_grouped_gemm_wgrad_ragged_k"):
+                    mate_gemm.ragged_k_moe_gemm_16bit(
+                        grad_output,
+                        flat_inp,
+                        counts,
+                        packed_wgrad,
+                        gemm_mode="per_expert",
+                        major_a_mode="M",
+                        major_b_mode="N",
+                    )
+                _log_once("wgrad: MATE ragged_k_moe_gemm_16bit (1 grouped launch)")
+            else:
+                from transformer_engine.pytorch.cpp_extensions.gemm import (
+                    general_grouped_gemm,
+                )
+                from transformer_engine.pytorch.module.base import (
+                    _2X_ACC_WGRAD,
+                    get_multi_stream_cublas_workspace,
+                )
+
+                input_mats = torch.split(flat_inp, ctx.m_splits)
+                grad_output_mats = torch.split(grad_output, ctx.m_splits)
+                with torch.profiler.record_function("mate_te_grouped_gemm_wgrad"):
+                    general_grouped_gemm(
+                        list(input_mats),
+                        list(grad_output_mats),
+                        wgrad_outputs,
+                        wgrad_outputs[0].dtype,
+                        get_multi_stream_cublas_workspace(),
+                        layout="NT",
+                        m_splits=list(ctx.m_splits),
+                        grad=True,
+                        accumulate=accumulate,
+                        use_split_accumulator=_2X_ACC_WGRAD,
+                    )
+
+            if ctx.use_main_grad:
+                # Megatron DDP must not add a second copy of this gradient.
+                for weight in weights:
+                    if hasattr(weight, "grad_added_to_main_grad"):
+                        weight.grad_added_to_main_grad = True
+            else:
+                wgrads = wgrad_outputs
+
+        return (dgrad, None, None, None, *wgrads)
+
+
+_LOGGED_ONCE = set()
+_MUTLASS_DECISION_SEEN = set()
+
+
+def _log_once(message: str) -> None:
+    """Print a MATE path decision once per process.
+
+    NOTE: do NOT gate this on RANK==0.  With PP=16 the first stage holds only
+    the dense layers, so rank 0 never runs the MoE grouped GEMM backward and a
+    rank-0-only log is silently never emitted (the same trap that hid the
+    TE_TN_GM6 path).  Every process prints at most once; grep with `sort -u`.
+    """
+    if message in _LOGGED_ONCE:
+        return
+    _LOGGED_ONCE.add(message)
+    print(f"[mate-grouped-gemm][rank{os.getenv('RANK', '?')}] {message}", flush=True)
+
+
+def _is_packed(weights: Sequence[torch.Tensor]) -> bool:
+    if not weights or not all(
+        isinstance(weight, torch.Tensor) and weight.is_contiguous() for weight in weights
+    ):
+        return False
+    bytes_per_weight = weights[0].numel() * weights[0].element_size()
+    base = weights[0].data_ptr()
+    return all(
+        weight.shape == weights[0].shape
+        and weight.dtype == weights[0].dtype
+        and weight.device == weights[0].device
+        and weight.data_ptr() == base + index * bytes_per_weight
+        for index, weight in enumerate(weights)
+    )
+
+
+def _static_layout_supported(module, device: torch.device, use_main_grad: bool) -> bool:
+    """Cache parameter/layout checks that are invariant during training.
+
+    Only successful checks are cached. This lets a module created before DDP
+    retry after ``main_grad`` and packed parameter storage have been installed.
+    The cache stores booleans and device metadata, never parameters or grads.
+    """
+    cache_key = (bool(use_main_grad), device.type, device.index)
+    cache = getattr(module, "_mate_static_support_cache", None)
+    if cache is not None and cache.get(cache_key, False):
+        return True
+
+    weights = [getattr(module, f"weight{i}") for i in range(module.num_gemms)]
+    supported = _is_packed(weights) and all(
+        weight.dtype == torch.bfloat16 and weight.device == device for weight in weights
+    )
+
+    if supported and use_main_grad:
+        main_grads = [getattr(weight, "main_grad", None) for weight in weights]
+        supported = all(
+            isinstance(grad, torch.Tensor)
+            and grad.dtype == torch.float32
+            and grad.device == device
+            and grad.shape == weight.shape
+            and grad.is_contiguous()
+            for weight, grad in zip(weights, main_grads)
+        )
+
+    if supported:
+        if cache is None:
+            cache = {}
+            module._mate_static_support_cache = cache
+        cache[cache_key] = True
+    return supported
+
+
+def _pack_weights_before_ddp(module) -> None:
+    """Pack expert Parameters before Megatron DDP remaps parameter storage."""
+    weights = [getattr(module, f"weight{i}") for i in range(module.num_gemms)]
+    if not weights or _is_packed(weights):
+        return
+    if any(
+        weight.dtype != torch.bfloat16 or weight.device.type != "musa" for weight in weights
+    ):
+        return
+
+    packed = torch.empty(
+        (len(weights), *weights[0].shape),
+        dtype=weights[0].dtype,
+        device=weights[0].device,
+    )
+    with torch.no_grad():
+        for index, weight in enumerate(weights):
+            packed[index].copy_(weight)
+            weight.data = packed[index]
+    # Parameter views retain the allocation. Do not keep a second module-level
+    # reference: distributed optimizer may later remap them into its own buffer.
+
+
+def _supported(
+    module,
+    inp: torch.Tensor,
+    counts: torch.Tensor,
+    use_main_grad: bool,
+) -> bool:
+    if (
+        module.fp8
+        or module.fp8_calibration
+        or module.apply_bias
+        or module.return_bias
+        or module.gemm_bias_unfused_add
+    ):
+        return False
+    if module.save_original_input:
+        return False
+    if not use_main_grad and module.fuse_wgrad_accumulation:
+        return False
+    if not inp.is_contiguous() or inp.dtype != torch.bfloat16 or inp.device.type != "musa":
+        return False
+    if (
+        not isinstance(counts, torch.Tensor)
+        or counts.dtype != torch.int32
+        or counts.device != inp.device
+        or not counts.is_contiguous()
+        or counts.numel() != module.num_gemms
+        or not hasattr(counts, "_mate_m_splits")
+        or len(counts._mate_m_splits) != module.num_gemms
+        or sum(counts._mate_m_splits) != inp.reshape(-1, inp.shape[-1]).shape[0]
+    ):
+        return False
+
+    return _static_layout_supported(module, inp.device, use_main_grad)
+
+
+def _host_splits(m_splits):
+    if not isinstance(m_splits, torch.Tensor):
+        return m_splits
+    if hasattr(m_splits, "_mate_m_splits"):
+        return list(m_splits._mate_m_splits)
+    return m_splits.tolist()
+
+
+@functools.lru_cache(maxsize=None)
+def _log_mutlass_kernel(kernel: str) -> None:
+    _log(f"native MUTLASS wgrad accumulation active: {kernel}")
+
+
+@functools.lru_cache(maxsize=None)
+def _log_mutlass_decision(
+    experts,
+    total_tokens,
+    out_features,
+    in_features,
+    min_tokens,
+    max_tokens,
+    use_main_grad,
+    accumulate,
+    input_contiguous,
+    grad_contiguous,
+    output_dtype,
+    output_shape,
+    output_contiguous,
+    selected,
+) -> None:
+    # 每 iteration 每层都会调用,这里按 (形状,判定) 去重,避免刷爆日志
+    _key = (experts, out_features, in_features, use_main_grad, accumulate, selected)
+    if _key in _MUTLASS_DECISION_SEEN:
+        return
+    _MUTLASS_DECISION_SEEN.add(_key)
+    _log(
+        "MUTLASS decision "
+        f"E={experts} totalM={total_tokens} N={out_features} K={in_features} "
+        f"counts=[{min_tokens},{max_tokens}] main_grad={use_main_grad} "
+        f"accumulate={accumulate} input_contig={input_contiguous} "
+        f"grad_contig={grad_contiguous} output={output_dtype}{tuple(output_shape)} "
+        f"output_contig={output_contiguous} selected={selected}"
+    )
+
+
+def install_mate_grouped_gemm() -> None:
+    """Install the opt-in GroupedLinear patch before model construction."""
+    import transformer_engine.pytorch as te
+
+    grouped_linear = te.GroupedLinear
+    if getattr(grouped_linear, "_mate_grouped_gemm_installed", False):
+        return
+
+    if env_flag("MUTLASS_WGRAD", "0"):
+        from .mutlass_wgrad import is_mp31_device, load_mutlass_wgrad
+
+        if is_mp31_device():
+            load_mutlass_wgrad()
+            _log("native MP31 MUTLASS wgrad extension loaded")
+        else:
+            _log("native MUTLASS wgrad disabled: current device is not MP31")
+
+    original_init = grouped_linear.__init__
+    original_forward = grouped_linear.forward
+
+    @functools.wraps(original_init)
+    def patched_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        _pack_weights_before_ddp(self)
+
+    @functools.wraps(original_forward)
+    def patched_forward(
+        self,
+        inp,
+        m_splits,
+        is_first_microbatch=None,
+        fine_grained_offload=False,
+    ):
+        use_main_grad = env_flag("MATE_USE_MAIN_GRAD", "1")
+        if not _supported(self, inp, m_splits, use_main_grad) or fine_grained_offload:
+            if not getattr(self, "_mate_fallback_logged", False):
+                weights = [getattr(self, f"weight{i}") for i in range(self.num_gemms)]
+                _log(
+                    f"fallback num_gemms={self.num_gemms} dtype={inp.dtype} "
+                    f"packed={_is_packed(weights)} use_main_grad={use_main_grad} "
+                    f"counts_dtype={getattr(m_splits, 'dtype', None)} "
+                    f"counts_device={getattr(m_splits, 'device', None)}"
+                )
+                self._mate_fallback_logged = True
+            return original_forward(
+                self,
+                inp,
+                _host_splits(m_splits),
+                is_first_microbatch,
+                fine_grained_offload,
+            )
+
+        if not getattr(self, "_mate_active_logged", False):
+            shape = inp.reshape(-1, inp.shape[-1]).shape
+            _log(
+                f"active num_gemms={self.num_gemms} shape=[{shape[0]},{shape[1]}] "
+                f"use_main_grad={use_main_grad}"
+            )
+            self._mate_active_logged = True
+
+        with self.prepare_forward(inp, num_gemms=self.num_gemms) as prepared_inp:
+            out = _MateGroupedLinear.apply(
+                prepared_inp,
+                m_splits,
+                use_main_grad,
+                is_first_microbatch,
+                *[getattr(self, f"weight{i}") for i in range(self.num_gemms)],
+            )
+        if self.return_bias:
+            return out, [None] * self.num_gemms
+        return out
+
+    grouped_linear.__init__ = patched_init
+    grouped_linear.forward = patched_forward
+    grouped_linear._mate_grouped_gemm_installed = True
+    _log(
+        "installed: MATE fprop/dgrad + guarded MUTLASS/Transformer Engine wgrad"
+    )
