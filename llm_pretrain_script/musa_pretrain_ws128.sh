@@ -338,7 +338,16 @@ ADD_NETWORK_SIZE_ARGS=(
     --use-flash-attn
     --no-rope-fusion
     --cross-entropy-loss-fusion
-    --cross-entropy-fusion-impl native
+    # 交叉熵融合实现走 TE 而非 native（对齐 musa_pretrain_worldsize512_caizhi.sh L587）：
+    #   native → megatron 的 fused_vocab_parallel_cross_entropy
+    #   te     → TE 的 parallel_cross_entropy（language_module.py L133 分支）
+    # 词表 129280、seq 4096、MBS 2，logits 是全流程最大的中间张量之一，
+    # TE 的实现把 max/sum/gather 压进一个 kernel，省掉 native 路径上的中间物化。
+    # 依赖：TE 已装且 megatron.core.extensions.transformer_engine 能导出
+    # te_parallel_cross_entropy（本集群 TE 2.0.0，已确认可导入）；导不到时
+    # language_module.py L155 会直接抛 RuntimeError 而不是静默回退，所以换环境要留意。
+    # 回退：把下面这行改回 native。
+    --cross-entropy-fusion-impl te
     --moe-permute-fusion
     --moe-router-force-load-balancing
     ${SHARED_EXPERT_OVERLAP_ARG}
