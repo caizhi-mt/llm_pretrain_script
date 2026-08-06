@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
@@ -17,6 +18,42 @@ from torch import Tensor, nn
 from megatron.core import parallel_state
 
 logger = logging.getLogger(__name__)
+
+
+def _env_flag(name: str, default: str) -> bool:
+    value = os.getenv(name, default).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean flag, got {value!r}")
+
+
+def _is_musa_tensor(t: Tensor) -> bool:
+    return bool(getattr(t, "is_musa", False))
+
+
+def _can_use_native_rope(
+    t: Tensor,
+    freqs: Tensor,
+    config: TransformerConfig,
+    cu_seqlens: Optional[Tensor],
+    mscale: float,
+) -> bool:
+    """Return whether the standard-RoPE MUDNN fast path is safe for this call."""
+
+    if not _env_flag("MUSA_NATIVE_ROPE", "1"):
+        return False
+    if cu_seqlens is not None or mscale != 1.0:
+        return False
+    if getattr(config, "context_parallel_size", 1) != 1:
+        return False
+    if getattr(config, "rope_type", None) != "rope":
+        return False
+    if not _is_musa_tensor(t) or not _is_musa_tensor(freqs) or not hasattr(torch, "rope"):
+        return False
+    return freqs.dim() == 4 and freqs.shape[1] == 1 and freqs.shape[2] == 1
+
 
 try:
     from apex.transformer.functional import (
@@ -58,6 +95,7 @@ def apply_rotary_pos_emb_bshd(t: Tensor, freqs: Tensor, rotary_interleaved: bool
     Returns:
         Tensor: The input tensor after applying RoPE
     """
+    ''' 
     rot_dim = freqs.shape[-1]
 
     # ideally t_pass is empty so rotary pos embedding is applied to all tensor t
@@ -70,6 +108,8 @@ def apply_rotary_pos_emb_bshd(t: Tensor, freqs: Tensor, rotary_interleaved: bool
 
     t = (t * cos_) + (_rotate_half(t, rotary_interleaved) * sin_)
     return torch.cat((t, t_pass), dim=-1)
+    '''
+    return torch.rope(t, freq_cis=freqs.squeeze(), rotary_interleaved=rotary_interleaved, batch_first=False, multi_latent_attention=True)
 
 
 def apply_rotary_pos_emb_thd(
@@ -111,6 +151,21 @@ def apply_rotary_pos_emb(
 
     if cp_group is None:
         cp_group = parallel_state.get_context_parallel_group()
+
+    if _can_use_native_rope(t, freqs, config, cu_seqlens, mscale):
+        if not getattr(apply_rotary_pos_emb, "printed_native_rope", False):
+            logger.info(
+                "Using MUDNN torch.rope for standard RoPE "
+                f"(multi_latent_attention={config.multi_latent_attention})"
+            )
+            apply_rotary_pos_emb.printed_native_rope = True
+        return torch.rope(
+            t,
+            freqs.squeeze(1).squeeze(1),
+            rotary_interleaved=config.rotary_interleaved,
+            batch_first=False,
+            multi_latent_attention=config.multi_latent_attention,
+        )
 
     # assert cu_seqlens is None, "Only support cu_seqlens is None for now!"
     if config.apply_rope_fusion and not HAVE_APPLY_ROPE_FUSION:
