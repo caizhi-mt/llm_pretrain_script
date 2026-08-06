@@ -73,7 +73,20 @@ export MCCL_ALGOS=${MCCL_ALGOS:-1}
 export MCCL_CHECK_POINTERS=${MCCL_CHECK_POINTERS:-0}
 export MCCL_IB_GID_INDEX=${MCCL_IB_GID_INDEX:-3}
 export MCCL_IB_TC=${MCCL_IB_TC:-122}
-export MCCL_BUFFSIZE=${MCCL_BUFFSIZE:-20971520}
+export MCCL_BUFFSIZE=${MCCL_BUFFSIZE:-20971520}   # 20MB：4MB 实测更差（PyTorch 侧 OOM 反增），8MB 仍不足
+# collective channel 数钉为 8（+0.52% 实测）
+#   注意库默认是 -2（拓扑自动），不是别处文档里说的常量 4；改前请用
+#   MCCL_DEBUG=INFO MCCL_DEBUG_SUBSYS=INIT 抓真实生效值，默认值 != 生效值。
+#   实测 16 与 8 完全持平，说明 8 已在拐点。
+#   p2p channel 由 collective 推导：设 collective=8 后 p2p 自动变 8，
+#   不要去设 MCCL_MIN_P2P_NCHANNELS —— 它会破坏数值正确性（iter1 grad norm
+#   8845，正常 35.66），已验证并撤销。
+#   为什么有效：这不是"重叠"，而是让 MCCL kernel 自身更快。本机 MCCL kernel
+#   与计算实测零并发，kernel 耗时直接在关键路径上。前提是 overlap_grad_reduce
+#   =False，梯度同步时 MCCL 独占 GPU，多占 SM 不挤压计算。
+#   ⚠ 若将来开启梯度重叠，该前提消失，必须重测。
+export MCCL_MIN_NCHANNELS=${MCCL_MIN_NCHANNELS:-8}
+export MCCL_MAX_NCHANNELS=${MCCL_MAX_NCHANNELS:-8}
 export MCCL_IB_TIMEOUT=${MCCL_IB_TIMEOUT:-19}
 export MCCL_IB_RETRY_CNT=${MCCL_IB_RETRY_CNT:-7}
 export MCCL_NET_SHARED_BUFFERS=${MCCL_NET_SHARED_BUFFERS:-0}
