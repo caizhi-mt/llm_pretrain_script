@@ -1,5 +1,10 @@
 import os
 import sys
+
+from .cpu_affinity import maybe_bind_local_rank_cpu_affinity
+
+maybe_bind_local_rank_cpu_affinity()
+
 import torch
 import torch.utils
 import torch.utils.data
