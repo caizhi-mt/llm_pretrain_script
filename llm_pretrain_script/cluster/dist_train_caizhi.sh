@@ -46,6 +46,7 @@ export MUSA_CPU_AFFINITY_MAP='0-7;8-15;16-23;24-31;64-71;72-79;80-87;88-95'
 # BF16 expert fast path（需要所有节点预装同版本 mate 与 mate-mubin）
 export MATE_GROUPED_GEMM=1       # fprop/dgrad=MATE, wgrad=TE grouped GEMM
 export MATE_USE_MAIN_GRAD=1      # wgrad 直写 FP32 main_grad, 避免 BF16 临时梯度和 add
+# export MATE_DEFER_DEEPEP_COUNTS=0   # 置 0 回退 DeepEP counts 同步构造路径
 
 # MATE MLA FlashAttention 前向（实验37，移植 PR#2 a82e08c；musa_pretrain_ws128.sh 默认 0）
 #   +0.46%，但 iter1 grad norm 35.852 超出 35.66±0.03 判据 —— 这是本清单里
