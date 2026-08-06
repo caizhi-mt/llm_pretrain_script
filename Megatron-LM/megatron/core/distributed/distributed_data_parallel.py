@@ -514,9 +514,17 @@ class DistributedDataParallel(_BaseDataParallel):
             if param in self.param_to_bucket_group:
                 assert param.requires_grad
                 if self.ddp_config.overlap_grad_reduce:
-                    assert (
-                        param.grad is not None
-                    ), 'param.grad being None is not safe when overlap_grad_reduce is True'
+                    # MATE (musa_patch/mate_grouped_gemm.py) writes the expert wgrad
+                    # straight into param.main_grad and sets grad_added_to_main_grad,
+                    # leaving param.grad as None -- the assert below would fire on every
+                    # expert weight.  Upstream mcore 0.19 carries the same exemption for
+                    # its GTP-remat weights ("param.grad here is throwaway ... rely on
+                    # grad_added_to_main_grad below").  The add_() right after is already
+                    # guarded by that flag, so skipping the assert is safe.
+                    if not getattr(param, 'grad_added_to_main_grad', False):
+                        assert (
+                            param.grad is not None
+                        ), 'param.grad being None is not safe when overlap_grad_reduce is True'
                 if param.grad is not None and (
                     not param.grad_added_to_main_grad or getattr(param, 'zero_out_wgrad', False)
                 ):

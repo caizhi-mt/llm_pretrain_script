@@ -268,6 +268,42 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# MATE_GROUPED_GEMM=1 -> MoE expert 的 BF16 GroupedLinear 走 MATE
+#   fprop/dgrad: MATE ragged-M GroupGEMM
+#   wgrad:       仍是一次 TE grouped GEMM,但直写 FP32 main_grad
+#   TE 的 module / 参数 / state_dict 格式都不变。
+#
+#   MATE_USE_MAIN_GRAD=1(默认)-> wgrad 直接写进常驻 FP32 main_grad,
+#   省掉 BF16 临时梯度张量和随后的 BF16->FP32 累加。它只在 MATE 路径内生效,
+#   MATE_GROUPED_GEMM=0 时无作用。
+#
+#   配套改动(缺一个就等于没开):
+#     - Megatron-LM moe/experts.py:构造 int32 device counts 并挂上
+#       _mate_m_splits(host 侧 split),MATE 吃 device tensor、TE wgrad 复用
+#       host 元数据,省掉专家层的一次 D2H 同步。_supported() 找不到
+#       _mate_m_splits 就【静默】回退 TE。
+#     - Megatron-LM distributed_data_parallel.py:MATE 把 wgrad 直写 main_grad
+#       并置 grad_added_to_main_grad,param.grad 保持 None,
+#       overlap_grad_reduce 下原来的 assert 会在每个 expert 权重上触发。
+#
+#   ⚠ 硬依赖:所有节点预装同版本 mate 与 mate-mubin。
+#   ⚠ 注意默认值不对称:musa_patch 的 env_flag 和 experts.py 的 os.getenv
+#     默认都是 "1",即【不设就是开】,且 env_flag 对非 0/1 直接 raise。
+#     所以这里显式导出、ssh 白名单也必须给默认值,不能传空串。
+#   ⚠ MATE 至今【没有在 X10000 上做过 A/B】(见 02_experiment_log 待测队列第 2 项:
+#     MoE 专家 GEMM 占 kernel 27%)。它是既有基线路径,不是实测过的增益项。
+#     本地这里默认 0,由入口脚本显式置 1 —— 与 pod 的 :-1 不同,是为了让
+#     "开着"这件事在入口可见。
+# ---------------------------------------------------------------------------
+export MATE_GROUPED_GEMM=${MATE_GROUPED_GEMM:-0}
+export MATE_USE_MAIN_GRAD=${MATE_USE_MAIN_GRAD:-1}
+if [ "${MATE_GROUPED_GEMM}" = "1" ]; then
+    echo "[mate-gemm] ENABLED (fprop/dgrad=MATE, wgrad=TE grouped GEMM, main_grad=${MATE_USE_MAIN_GRAD})"
+else
+    echo "[mate-gemm] disabled"
+fi
+
+# ---------------------------------------------------------------------------
 # MATE_FLASH_ATTN=1 -> MLA FlashAttention 前向走 MATE 0.2.5 MUBIN
 #   只替换 TE 引用的 flash_attn_func 的**前向**;backward 仍用原生 MUSA
 #   aten::_scaled_dot_product_attention_flash_musa_backward(不用 MATE varlen bwd)。
@@ -294,7 +330,7 @@ fi
 export MATE_FLASH_ATTN=${MATE_FLASH_ATTN:-0}
 # MUBIN 元数据缓存(mate_flash_attention.py 读取,代码内默认 1)。
 export MATE_CACHE_MUBIN_DISPATCH=${MATE_CACHE_MUBIN_DISPATCH:-1}
-for flag_name in MATE_FLASH_ATTN MATE_CACHE_MUBIN_DISPATCH; do
+for flag_name in MATE_GROUPED_GEMM MATE_USE_MAIN_GRAD MATE_FLASH_ATTN MATE_CACHE_MUBIN_DISPATCH; do
     flag_value=${!flag_name}
     if [[ "${flag_value}" != "0" && "${flag_value}" != "1" ]]; then
         echo "Error: ${flag_name} must be 0 or 1, got '${flag_value}'" >&2
