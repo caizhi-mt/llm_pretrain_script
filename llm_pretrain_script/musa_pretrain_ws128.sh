@@ -193,6 +193,86 @@ RB_RATE=1e-3
 INIT_STD=0.006
 
 # ---------------------------------------------------------------------------
+# ENABLE_MOE_SHARED_EXPERT_OVERLAP=1 -> --moe-shared-expert-overlap   (+1.3%)
+#   官方 5 段式 shared-expert / 通信重叠，已移植到 flex(DeepEP) dispatcher
+#   （上游 transformer_config.py 的 assert 原本只允许 alltoall）。
+#   shared expert 跑在自己的 stream 上：fc1 盖 dispatch a2a，fc2 盖 combine a2a，
+#   并用 set_tensor_grad_fn_sequence_sr 抬高反向调度优先级使反向也重叠。
+#
+#   为什么有效：重叠对象是 DeepEP 的 memcpy（CE 路径），不是 MCCL kernel。
+#   CE 与计算实测串行度 0.04（几乎完全并行）；而 MCCL kernel 与计算并发实测
+#   0.00%，所以重叠类优化在本机只有走 CE 才可能有收益。
+#
+#   反向要单独补一刀：linear_fc1_forward_and_act(overlapped_comm_output) 的参数
+#   不是数据输入，唯一用途是 set_tensor_grad_fn_sequence_sr(..., INT_MAX)。fc1
+#   提前后无参可传，反向重叠会静默失效（约占一半收益）。解法是解耦——在
+#   dispatch_postprocess 里单独对 dispatch 输出打优先级。
+export ENABLE_MOE_SHARED_EXPERT_OVERLAP=${ENABLE_MOE_SHARED_EXPERT_OVERLAP:-1}
+if [ "${ENABLE_MOE_SHARED_EXPERT_OVERLAP}" = "1" ]; then
+    SHARED_EXPERT_OVERLAP_ARG="--moe-shared-expert-overlap"
+    echo "[shared-expert-overlap] ENABLED (5 段式，fc1 盖 dispatch / fc2 盖 combine)"
+else
+    SHARED_EXPERT_OVERLAP_ARG=""
+    echo "[shared-expert-overlap] disabled"
+fi
+
+# ---------------------------------------------------------------------------
+# ENABLE_MOE_SE_LATE_ISSUE -> MOE_SE_LATE_ISSUE   0=关 1=只挪 fc1 2=fc1+fc2  (+1.08%)
+#   把 shared expert 的下发从 a2a 调用【之前】挪到【之后】(fc1 进
+#   dispatch_postprocess，fc2 进 combine_postprocess)。依赖上面那项。
+#
+#   前提修正:token_dispatch 只阻塞 CPU 到 ace_notify_dispatch 完成(要拿
+#   num_recv_tokens 这个 host 数据),真正的 D2D payload 是在它【返回之后】才
+#   异步跑的。rank32 iter6 实测:FusedDispatch 的 cpu_op 在 +18296us 结束,
+#   payload 跑在 +18365..+20183us。所以 5 段式那句"在它之后下发什么也盖不住"
+#   不成立 —— 恰恰相反,在它之前下发才盖不住。
+#
+#   改之前实测:fc1 中位比 payload 早 2.9ms 起跑、早 1.4ms 结束,fc2 中位比它
+#   该盖的 combine 早 17.2ms。正向对 payload 覆盖率 0%(只盖住 20% 的元数据段),
+#   反向 24%。不需要显式 event:CPU 阻塞本身就是同步器,流不可能执行 host 还
+#   没下发的活。
+#
+#   实测:GBS=8192 下 175.15 -> 177.1(+1.08%,iter2-8 连续 7 点同向);
+#   GBS=2048 下 133.65 -> 135.0(+1.01%)。loss iter1 偏离 5.0e-5,而同配置 run
+#   自然离散 2.20e-4,比值 0.23。
+#
+#   level=2 实测与 level=1 持平略低,用 1:fc2 本来就跑在 expert grouped GEMM
+#   底下被完全盖住、不花钱,挪它省不出没花的时间,还会把 fc2 排到 get_output()
+#   前面。
+export ENABLE_MOE_SE_LATE_ISSUE=${ENABLE_MOE_SE_LATE_ISSUE:-1}
+if [ "${ENABLE_MOE_SE_LATE_ISSUE}" != "0" ]; then
+    if [ "${ENABLE_MOE_SHARED_EXPERT_OVERLAP}" != "1" ]; then
+        echo "Error: ENABLE_MOE_SE_LATE_ISSUE=${ENABLE_MOE_SE_LATE_ISSUE} 需要 ENABLE_MOE_SHARED_EXPERT_OVERLAP=1" >&2
+        exit 1
+    fi
+    export MOE_SE_LATE_ISSUE=${ENABLE_MOE_SE_LATE_ISSUE}
+    echo "[se-late-issue] ENABLED level=${MOE_SE_LATE_ISSUE} (1=只挪 fc1 / 2=fc1+fc2)"
+else
+    export MOE_SE_LATE_ISSUE=0
+    echo "[se-late-issue] disabled"
+fi
+
+# ---------------------------------------------------------------------------
+# ENABLE_MOE_SHARED_EXPERT_EARLY=1 -> MOE_SHARED_EXPERT_EARLY=1   【默认关】
+#   方案C：在 MoELayer.custom_forward 里把 shared expert 提到 dispatch 之前算完，
+#   再把结果透传给 experts_compute。实测约 +0.3%，已被上面的完整 5 段式取代，
+#   二者【互斥】(完整版由 dispatcher 持有 shared_experts，此处会跳过)。
+#   代码保留以防重复探索。
+export ENABLE_MOE_SHARED_EXPERT_EARLY=${ENABLE_MOE_SHARED_EXPERT_EARLY:-0}
+if [ "${ENABLE_MOE_SHARED_EXPERT_EARLY}" = "1" ]; then
+    export MOE_SHARED_EXPERT_EARLY=1
+    echo "[shared-expert-early] ENABLED (提前到 dispatch 之前下发)"
+else
+    export MOE_SHARED_EXPERT_EARLY=0
+    echo "[shared-expert-early] disabled"
+fi
+
+# MOE_SE_DISPATCH_EVENT：给 a2a 传一个在 shared expert 入队【之前】记录的 event，
+#   使 comm stream 不再等 fc1。实验39 实测 +0：那 211.2 ms 空隙里 GPU 有 99.7%
+#   在跑 fc1，不是可回收的损失。代码保留，默认 0（token_dispatcher.py 读该变量）。
+export MOE_SE_DISPATCH_EVENT=${MOE_SE_DISPATCH_EVENT:-0}
+
+# ---------------------------------------------------------------------------
 # 数据 / 输出路径（RUN_NAME 来自 LOG_NAME，避免 cache/ckpt 互相覆盖）
 # ---------------------------------------------------------------------------
 BASE=/mnt/code/llm_pretrain
@@ -261,6 +341,7 @@ ADD_NETWORK_SIZE_ARGS=(
     --cross-entropy-fusion-impl native
     --moe-permute-fusion
     --moe-router-force-load-balancing
+    ${SHARED_EXPERT_OVERLAP_ARG}
 )
 # GroupGEMM（对齐 examples 各模型脚本的使能方式，即 --moe-grouped-gemm 参数）:
 # MOE_GROUPED_GEMM=1（默认，原行为）→ 专家计算走 GroupedMLP

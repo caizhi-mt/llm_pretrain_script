@@ -80,10 +80,21 @@ class FusedDispatch(torch.autograd.Function):
         group,
         async_finish=False,
         allocate_on_comm_stream=False,
+        previous_event=None,
     ):
-        """Forward pass of fused dispatch."""
-        previous_event = None
-        if async_finish:
+        """Forward pass of fused dispatch.
+
+        ``previous_event`` lets the caller supply a compute-stream event recorded
+        EARLIER than this call.  The comm stream then waits on that event instead of
+        on "everything enqueued so far", which is what a bare ``EventHandle()`` means.
+
+        This matters when the caller deliberately enqueues independent compute (the
+        MoE shared expert) after the a2a's real producers but before this call: with
+        the default event the a2a would also wait for that compute, so no overlap is
+        possible.  The a2a only truly depends on x / token_indices / token_probs, so
+        an event recorded once those are enqueued is still a correct dependency.
+        """
+        if previous_event is None and async_finish:
             previous_event = EventOverlap(EventHandle())
         # Calculate layout before actual dispatch
         buffer = get_buffer(group, get_hidden_bytes(x))
@@ -160,7 +171,7 @@ class FusedDispatch(torch.autograd.Function):
         if ctx.async_finish:
             after_event.current_stream_wait()
 
-        return grad_x, None, grad_token_probs, None, None, None, None
+        return grad_x, None, grad_token_probs, None, None, None, None, None
 
 
 class FusedCombine(torch.autograd.Function):
@@ -222,6 +233,7 @@ if HAVE_DEEP_EP:
         group,
         async_finish=False,
         allocate_on_comm_stream=False,
+        previous_event=None,
     ):
         """Perform fused dispatch operation if deep_ep is available.
 
@@ -244,6 +256,7 @@ if HAVE_DEEP_EP:
             group,
             async_finish,
             allocate_on_comm_stream,
+            previous_event,
         )
 
     def fused_combine(x, group, handle, async_finish=False, allocate_on_comm_stream=False):
@@ -260,6 +273,14 @@ if HAVE_DEEP_EP:
         """
         return FusedCombine.apply(x, group, handle, async_finish, allocate_on_comm_stream)
 
+    def make_dispatch_event():
+        """Record current compute-stream progress, to pass as ``previous_event``.
+
+        Lets the caller enqueue independent compute after this point without the a2a
+        waiting for it.
+        """
+        return EventOverlap(EventHandle())
+
     def set_deepep_num_sms(num_sms):
         """Sets the number of SMs to use for DeepEP"""
         Buffer.set_num_sms(num_sms)
@@ -268,3 +289,4 @@ else:
     fused_dispatch = None
     fused_combine = None
     set_deepep_num_sms = None
+    make_dispatch_event = None

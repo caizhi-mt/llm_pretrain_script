@@ -769,10 +769,16 @@ class TransformerConfig(ModelParallelConfig):
                     f"but got {self.moe_shared_expert_intermediate_size}"
                 )
             if self.moe_shared_expert_overlap and self.moe_token_dispatcher_type not in [
-                "alltoall"
+                "alltoall",
+                # "flex" (DeepEP) support added in MoEFlexTokenDispatcher: the shared
+                # expert runs on its own stream with fc1 issued before the (blocking)
+                # DeepEP dispatch and fc2 before token_combine.  See the note on
+                # MoEFlexTokenDispatcher.set_shared_experts for why the stage placement
+                # differs from the alltoall dispatcher.
+                "flex",
             ]:
                 raise ValueError(
-                    f"moe_shared_expert_overlap only works with alltoall token dispatcher."
+                    f"moe_shared_expert_overlap only works with alltoall/flex token dispatcher."
                 )
 
         if isinstance(self.moe_router_load_balancing_type, list):
