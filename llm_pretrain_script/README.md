@@ -96,6 +96,128 @@ export PROFILE_STEP_END=6         # 可选,Megatron --profile-step-end,默认 6
 
 回退开关在 `cluster/dist_train_caizhi.sh` 顶部(默认注释),经 `dist_run_megatron.sh` SSH 白名单透传;启动横幅打印 `GROUP_GEMM: 0/1`。
 
+## MATE expert BF16 fast path
+
+在 BF16、无 bias 的 GroupedMLP 上提供可回退的混合实现:
+
+- fprop/dgrad: MATE `ragged_m_moe_gemm_16bit`;
+- wgrad:单次 Transformer Engine `general_grouped_gemm(layout="NT")`;
+- wgrad 直接写 FP32 `main_grad`,不创建 BF16 临时梯度,也不增加后续 BF16→FP32 add/cast。
+
+该路径只局部接管 MoE expert GroupedLinear。ws128 现有的全局
+`--no-gradient-accumulation-fusion` 保持不变,因此不会改变 dense Linear 的反向路径。
+
+启用方式:
+
+```bash
+export MATE_GROUPED_GEMM=1
+export MATE_USE_MAIN_GRAD=1
+export MATE_FLASH_ATTN=1
+```
+
+两个变量经 `cluster/dist_run_megatron.sh` 的 SSH 白名单传到所有节点。设置
+`MATE_GROUPED_GEMM=0` 可完整回退原 Transformer Engine GroupedLinear。
+
+依赖与限制:
+
+- 每个节点必须安装同版本的 `mate` 与 `mate-mubin`;启动脚本会检查并打印版本。
+- 当前仅支持 BF16、连续 MUSA tensor、无 bias、非 FP8、DeepEP/GroupedMLP 路径;不满足条件时会打印一次 fallback 并走原 TE 实现。
+- 当前生产配置未开启 overlap-grad-reduce。后续若开启该功能,需要先补充 direct-main-grad 的梯度 ready 验证。
+- MATE 使用 `backend="mubin"`;不要只安装 `mate` 后让 128 节点在首次 kernel 时并发下载产物。
+
+`MATE_CACHE_MUBIN_DISPATCH=1` 默认缓存不可变的 MUBIN module/dispatcher、已校验
+artifact，以及按最终 `GemmMubinId` 选择的 kernel path。每一步仍使用当前动态
+`M` 和 routing counts 选择 ASM id，并把当前 input/weight/output/counts 直接传给
+launch；cache 不持有 tensor、data pointer 或专家 token 分布。设为 `0` 可回退
+MATE 原生逐次 dispatch，仅用于 A/B 或故障排查。
+
+## DeepEP local Permute/Unpermute compact fast path
+
+`MUSA_COMPACT_PERMUTE=1` 默认把 DeepEP 返回的 `[tokens, router_topk]` indices/probs
+转换为 compact TE row map，使 local permute/unpermute 的 native MUSA kernel 只扫描
+router top-k 列，不再扫描全部 local-expert 列。每一步都会按当前 routing 重新生成
+映射，不缓存专家选择、counts、tensor 或 data pointer，因此支持动态且非均匀的
+expert token 分布；输入沿用 DeepEP/router top-k 的每 token expert id 唯一约束。
+
+快路径仅用于 DeepEP-ACE 的 MUSA BF16 hidden、FP32 probs、连续 int32/int64 indices，
+且 hidden dim 必须为 8 的倍数、router top-k 必须为 4 的倍数；其他配置自动回退原
+TE dense 路径。需要 A/B 或
+排查时可在所有节点设置：
+
+```bash
+export MUSA_COMPACT_PERMUTE=0
+```
+
+单机 8×S5000、EP8、2 层 MoE、seq4096、MBS2、BF16、full recompute、fake data、
+force-load-balancing 的 8-rank trace 中，四段 local permutation kernel 总和由
+`14.792 ms` 降到 `13.537 ms`（`-8.48%`），全部 GEMM 无结构性回退。两组反向顺序
+30-step A/B 的稳态中位数均改善，分别为 `-3.0 ms` 和 `-2.3 ms`；生产拓扑仍需
+独立复测。
+
+## MLA q/kv down-projection fusion
+
+`MUSA_FUSED_MLA_DOWN_PROJ=1` 默认在 TP1、无 linear bias 的 MUSA FP16/BF16 MLA
+路径中合并 q-lora 与 kv-lora/rope down projection。forward 和 dgrad 各由两个 GEMM
+变为一个 GEMM；两个原始 Parameter、checkpoint key、optimizer state 和 FP32
+`main_grad` 保持不变，因此无需转换旧 checkpoint。
+
+其他 dtype/device、TP>1、启用 bias 或 `q_lora_rank=None` 时自动回退。需要 A/B 时：
+
+```bash
+export MUSA_FUSED_MLA_DOWN_PROJ=0
+```
+
+单机 8×S5000、两层、seq4096、MBS2、BF16、EP8、full recompute 的三组正反顺序
+30-step A/B 中，稳态中位数平均减少约 `0.87 ms`，MAD 过滤均值平均减少约
+`1.28 ms`；hidden loss 最大相对差 `0.016%`，无 NaN/skip。该小幅收益需要在生产
+PP16/EP8 拓扑再次确认。
+
+## MATE MLA FlashAttention forward
+
+DeepSeek MLA 的 BF16 fixed-length attention 默认使用混合实现：
+
+- forward：MATE 0.2.5 MUBIN FlashAttention；
+- backward：保留原生 MUSA `aten::_scaled_dot_product_attention_flash_musa_backward`；
+- dispatch cache：复用 `MATE_CACHE_MUBIN_DISPATCH=1`，缓存不可变的 MUBIN
+  artifact 选择和 launch handle，不缓存 Q/K/V、LSE 或 attention 输出。
+
+快路径只接管 `Dqk=192/Dv=128`、causal、dropout=0、无 ALiBi/softcap、
+CP=1、`USE_RECOMPUTE_VARIANCE=0` 的 MUSA BF16 BSHD 输入；其他配置完整回退
+原 Transformer Engine FlashAttention。当前私有 MUBIN API 固定验证
+`mate=mate-mubin=0.2.5`，版本不匹配时保持原生路径。
+
+```bash
+# 默认开启；完整回退原生 MUSA FlashAttention
+export MATE_FLASH_ATTN=0
+
+# 同时关闭 GroupGEMM/FA 的 MUBIN dispatch cache，仅用于 A/B
+export MATE_CACHE_MUBIN_DISPATCH=0
+```
+
+该实现会保存 MATE forward 的 output/LSE，并在 backward 以 BHSD view 交给原生
+MUSA kernel；不会调用 MATE 0.2.5 自带的 varlen backward。
+
+## MUSA MLA RoPE fast path
+
+标准 `--rope-type rope`、MLA、BF16 训练默认开启两级 MUSA 优化:
+
+- `MUSA_NATIVE_ROPE=1`:未使用 MLA 布局融合时,Q/K RoPE 走 MUDNN `torch.rope`,替代 eager `cos/sin/mul/cat` 组合算子。
+- `MUSA_FUSED_MLA_ROPE=1`:一次完成 Q RoPE 以及 KV split、K RoPE/broadcast 和 Q/K/V 连续布局,去掉 attention 前的 Q/K `cat` 与 V `contiguous`。MUSA dQ 使用 16-head tile;CUDA 保持原 tile。
+
+当前融合布局仅对标准 RoPE、MUSA BF16/FP16、CP=1、非 packed sequence、非 inference 生效,且 QK/位置/V head dim 必须为 2 的幂;其他配置安全回退原路径。两个变量均由 `cluster/dist_run_megatron.sh` 透传,并由 `musa_pretrain_ws128.sh` 校验为 `0/1`。
+
+回退方式:
+
+```bash
+# 只关闭 MLA Q/K/V 布局融合,保留 MUDNN torch.rope
+export MUSA_FUSED_MLA_ROPE=0
+
+# 完整回退 eager 标准 RoPE;同时不会启用 MLA 布局融合
+export MUSA_NATIVE_ROPE=0
+```
+
+单机 8×S5000、EP8、1 层 MoE、seq=4096、MBS=2、BF16、fake data 的 8-rank trace 中,Profiler step 中位数由 541.895 ms 降至 538.808 ms(-0.57%),GPU active union 均值减少 3.46 ms。4-step loss 最大绝对差为 `1.3e-4`,无 NaN/skipped iteration。该数据只用于验证单机算子和短程 loss;128 机生产拓扑仍需独立 A/B。
+
 关键路径(pod 内):
 
 - 训练输出/ckpt:`/home/jd/wangkang/llm_pretrain/outputs/${LOG_NAME}`

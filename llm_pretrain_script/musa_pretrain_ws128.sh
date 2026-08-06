@@ -271,6 +271,56 @@ if [ "${MOE_GROUPED_GEMM}" = "1" ]; then
         --moe-grouped-gemm
     )
 fi
+
+# BF16 MoE expert fast path:
+#   fprop/dgrad: MATE ragged-M GroupGEMM
+#   wgrad:       one Transformer Engine grouped GEMM call, directly into FP32 main_grad
+# Enabled by default; every node must have matching mate and mate-mubin packages.
+export MATE_GROUPED_GEMM=${MATE_GROUPED_GEMM:-1}
+export MATE_USE_MAIN_GRAD=${MATE_USE_MAIN_GRAD:-1}
+export MATE_FLASH_ATTN=${MATE_FLASH_ATTN:-1}
+export MATE_CACHE_MUBIN_DISPATCH=${MATE_CACHE_MUBIN_DISPATCH:-1}
+export MATE_DEFER_DEEPEP_COUNTS=${MATE_DEFER_DEEPEP_COUNTS:-1}
+export MUSA_COMPACT_PERMUTE=${MUSA_COMPACT_PERMUTE:-1}
+export MUSA_FUSED_MLA_DOWN_PROJ=${MUSA_FUSED_MLA_DOWN_PROJ:-1}
+export MUSA_NATIVE_ROPE=${MUSA_NATIVE_ROPE:-1}
+export MUSA_FUSED_MLA_ROPE=${MUSA_FUSED_MLA_ROPE:-1}
+for flag_name in MATE_GROUPED_GEMM MATE_USE_MAIN_GRAD MATE_FLASH_ATTN MATE_CACHE_MUBIN_DISPATCH MATE_DEFER_DEEPEP_COUNTS MUSA_COMPACT_PERMUTE MUSA_FUSED_MLA_DOWN_PROJ MUSA_NATIVE_ROPE MUSA_FUSED_MLA_ROPE; do
+    flag_value=${!flag_name}
+    if [[ "${flag_value}" != "0" && "${flag_value}" != "1" ]]; then
+        echo "Error: ${flag_name} must be 0 or 1, got '${flag_value}'" >&2
+        exit 2
+    fi
+done
+if [[ "${MATE_GROUPED_GEMM}" = "1" && "${MOE_GROUPED_GEMM}" != "1" ]]; then
+    echo "Error: MATE_GROUPED_GEMM=1 requires MOE_GROUPED_GEMM=1" >&2
+    exit 2
+fi
+if [[ "${MATE_GROUPED_GEMM}" = "1" || "${MATE_FLASH_ATTN}" = "1" ]]; then
+    python - <<'PY'
+from importlib.metadata import PackageNotFoundError, version
+
+packages = ("mate", "mate-mubin")
+versions = {}
+for package in packages:
+    try:
+        versions[package] = version(package)
+    except PackageNotFoundError as exc:
+        raise SystemExit(
+            f"MATE fast paths require {package!r} on every node"
+        ) from exc
+if versions["mate"] != versions["mate-mubin"]:
+    raise SystemExit(
+        "mate and mate-mubin versions must match: "
+        f"{versions['mate']} != {versions['mate-mubin']}"
+    )
+print(
+    "MATE expert fast path packages: "
+    f"mate={versions['mate']} mate-mubin={versions['mate-mubin']}",
+    flush=True,
+)
+PY
+fi
 # MoE dispatcher（对齐 telechat3/105B run_pretrain_telechatv3_105B_musa.sh）:
 # USE_DEEPEP_ACE=1 → flex + deepep + ACE（musa_patch deepep_ace，fused_a2a Buffer use_ace=True）
 # USE_DEEPEP_ACE=0 → 回退原 alltoall 路径
@@ -501,6 +551,10 @@ echo "  TRAIN_ITERS: ${TRAINING_STEPS}"
 echo "  PROFILER   : ${ENABLE_PROFILER:-0}"
 echo "  DEEPEP_ACE : ${USE_DEEPEP_ACE}"
 echo "  GROUP_GEMM : ${MOE_GROUPED_GEMM}"
+echo "  MATE_FD_TE_W: ${MATE_GROUPED_GEMM} (main_grad=${MATE_USE_MAIN_GRAD})"
+echo "  MATE_FA_FWD : ${MATE_FLASH_ATTN} (cache=${MATE_CACHE_MUBIN_DISPATCH})"
+echo "  COMPACT_PERM: ${MUSA_COMPACT_PERMUTE}"
+echo "  MLA_DOWN_FUSE: ${MUSA_FUSED_MLA_DOWN_PROJ}"
 echo "  RUN_NAME   : ${RUN_NAME}"
 echo "  LOG        : ${LOG_OUTPUT}/output_rank${NODE_RANK}.log"
 echo "========================================"

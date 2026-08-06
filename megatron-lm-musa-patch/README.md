@@ -14,6 +14,8 @@ MT-Megatron is a python patch of [Megatron-LM](https://github.com/NVIDIA/Megatro
 
 # Getting started
 
+MATE 提交线程的 Intel Xeon/AMD EPYC 绑核方法见 [MATE CPU 绑核指南](docs/mate_cpu_affinity.md)。
+
 ## 1. Prepare the code
 
 You can create a directory named `train_dev`, and use the command below to clone the `MT-Megatron-LM`, `MT-TransformerEngine` and `Megatron-LM` to the `train_dev`.  
@@ -85,4 +87,3 @@ If you find any problems for large model training using MT-Megatron, please open
 
 # Acknowledgements
 Initial development leveraged code from the [FlagScale](https://github.com/FlagOpen/FlagScale), acknowledgments to their team.
-
