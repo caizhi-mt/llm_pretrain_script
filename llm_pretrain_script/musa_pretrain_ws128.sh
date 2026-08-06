@@ -268,6 +268,33 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# MUSA_COMPACT_PERMUTE=1 -> DeepEP local permute/unpermute 用 compact row map
+#   DeepEP 本就返回 [tokens, router_topk];原路径把它摊成
+#   [tokens, local_experts] dense 再喂 TE 的 native MUSA kernel,kernel 要扫全部
+#   32 个 local-expert 列。compact 后只扫 topk=8 列 -> 扫描量降到 1/4。
+#   守卫(musa_patch/compact_permutation.py:is_supported):
+#     musa / bf16 / 2维连续 / hidden%8==0(7168 ok) / topk%4==0(8 ok)
+#     / probs fp32 / indices int32|int64 连续 / num_local_experts>=topk(32>=8 ok)
+#   另需 triton(本机 3.1.0 ok)与 TE 的 make_row_id_map(已验)。
+#   任一不满足则回退原 TE dense 路径。
+#
+#   ⚠ triton 缺失是【静默】回退:compact_permutation_enabled() 里
+#     _HAVE_TRITON 为假就直接返回 False,不报错也不打日志,开关看着是 1 但没生效。
+#     换环境后要确认 import triton 可用。
+#
+#   trace 实测本项开销:permute_with_mask_map 321.3ms + moe_unpermute_mask
+#   473.6ms = 795ms = 窗口 2.2%;作者报 kernel -8.48%、端到端约 0.25%。
+#   来源 PR#2 commit 96da2cb(作者 sunyanguomt),验证在 S5000 上做,
+#   作者亦注明"生产拓扑仍需独立复测"。
+# ---------------------------------------------------------------------------
+export MUSA_COMPACT_PERMUTE=${MUSA_COMPACT_PERMUTE:-0}
+if [ "${MUSA_COMPACT_PERMUTE}" = "1" ]; then
+    echo "[compact-permute] ENABLED (只扫 topk 列, 非 32 个 local-expert 列)"
+else
+    echo "[compact-permute] disabled"
+fi
+
+# ---------------------------------------------------------------------------
 # MUSA_FUSED_MLA_DOWN_PROJ=1 -> 融合 MLA 的 q-lora 与 kv-lora/rope 两个下投影
 #   [7168->1536] 与 [7168->576] 合成一次 [7168->2112] GEMM(前向 + dgrad);
 #   wgrad 仍分别写回原两个 FP32 main_grad -> 参数结构与 checkpoint 不变。

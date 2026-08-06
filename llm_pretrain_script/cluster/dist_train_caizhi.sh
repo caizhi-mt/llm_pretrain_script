@@ -27,6 +27,11 @@ export USE_DEEPEP_ACE=1          # 置 0 回退 alltoall dispatcher（当前该�
 #   +0.12%，iter1 gnorm=35.668 已复核。置 0 回退原双 linear 路径。
 export MUSA_FUSED_MLA_DOWN_PROJ=1
 
+# DeepEP compact permute（实验36，移植 PR#2 96da2cb；musa_pretrain_ws128.sh 默认 0）
+#   permute/unpermute kernel 只扫 topk=8 列而非 32 个 local-expert 列。
+#   注意 triton 不可用时是静默回退，换环境要确认 import triton 成功。
+export MUSA_COMPACT_PERMUTE=1
+
 # GroupGEMM（对齐 examples 各模型脚本 --moe-grouped-gemm；musa_pretrain_ws128.sh 默认已开）
 # export MOE_GROUPED_GEMM=0        # 置 0 去掉 --moe-grouped-gemm，回退 SequentialMLP（仅排查问题用）
 
