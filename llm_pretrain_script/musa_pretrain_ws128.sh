@@ -510,7 +510,19 @@ TRAINING_ARGS=(
     --adam-beta2 ${ADAM_BETA2}
     --moe-aux-loss-coeff ${LB_RATE}
     --moe-router-bias-update-rate ${RB_RATE}
-    --no-gradient-accumulation-fusion                          # MUSA patch 反向梯度数量不匹配（expected 9 got 8）
+    # 梯度累加融合已使能（对齐 musa_pretrain_worldsize512_caizhi.sh L1475：该行保持注释）。
+    # 原先关掉是因为 MUSA patch 的 LinearWithGradAccumulationAndAsyncCommunication
+    # 反向返回的梯度个数与前向入参对不上（expected 9 got 8）；现在 patch 里前向是
+    # 9 个入参（input/weight/bias/gradient_accumulation_fusion/allreduce_dgrad/
+    # sequence_parallel/grad_output_buffer/wgrad_deferral_limit/tp_group），反向两条
+    # return 路径也都返回 9 个，这个不匹配已经不存在，不必再关。
+    # 打开后 wgrad 由 fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32 直接累加进
+    # weight.main_grad，省掉单独物化一个 BF16 grad_weight 再 add 到 main_grad 的往返；
+    # 与 MATE_USE_MAIN_GRAD=1 是同一条思路，只是覆盖 patch 接管的那部分 linear。
+    # 依赖：fused_weight_gradient_mlp_cuda 可导入（本集群已确认，导出
+    # wgrad_gemm_accum_fp32 / wgrad_gemm_accum_fp16 两个符号）。
+    # 生产 run 的参数 dump 里 gradient_accumulation_fusion = True，即以此配置在跑。
+    #--no-gradient-accumulation-fusion                         # 需要回退时取消注释
     --eval-iters 0
     --eval-interval ${SAVE_INTERVAL}
     --save ${SAVE_PATH}
