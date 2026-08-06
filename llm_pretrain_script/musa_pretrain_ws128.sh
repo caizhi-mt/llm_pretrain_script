@@ -267,6 +267,29 @@ else
     echo "[shared-expert-early] disabled"
 fi
 
+# ---------------------------------------------------------------------------
+# MUSA_FUSED_MLA_DOWN_PROJ=1 -> 融合 MLA 的 q-lora 与 kv-lora/rope 两个下投影
+#   [7168->1536] 与 [7168->576] 合成一次 [7168->2112] GEMM(前向 + dgrad);
+#   wgrad 仍分别写回原两个 FP32 main_grad -> 参数结构与 checkpoint 不变。
+#   守卫 musa_patch/fused_mla_down_projection.py:is_supported():
+#     TP=1 / FP16|BF16 / musa 设备 / 权重连续 / add_bias_linear=False
+#   任一不满足则自动回退原双 linear 路径。
+#   本机 kernel 串行执行,kernel 数减半直接折算墙钟,机制上有利。
+#
+#   来源:PR#2 commit c17e7f0(作者 sunyanguomt)。其验证在 S5000 上做,
+#   本集群是 X10000,数值已自行复核:实验35 iter1 gnorm=35.668(判据 35.66+-0.03)。
+#   实测 +0.12%(173.35 -> 173.5 中位),贴噪声但方向一致,无副作用。
+#   已修上游一处必崩的 UnboundLocalError:`from ... import` 原放在 supported
+#   缓存分支内,第二次前向起该函数局部名未绑定即崩;本地版本已把 import 提出该
+#   分支(见 Megatron-LM/megatron/core/transformer/multi_latent_attention.py)。
+# ---------------------------------------------------------------------------
+export MUSA_FUSED_MLA_DOWN_PROJ=${MUSA_FUSED_MLA_DOWN_PROJ:-0}
+if [ "${MUSA_FUSED_MLA_DOWN_PROJ}" = "1" ]; then
+    echo "[mla-down-proj] 融合 ENABLED (q+kv 下投影合并为一次 GEMM)"
+else
+    echo "[mla-down-proj] disabled"
+fi
+
 # MOE_SE_DISPATCH_EVENT：给 a2a 传一个在 shared expert 入队【之前】记录的 event，
 #   使 comm stream 不再等 fc1。实验39 实测 +0：那 211.2 ms 空隙里 GPU 有 99.7%
 #   在跑 fc1，不是可回收的损失。代码保留，默认 0（token_dispatcher.py 读该变量）。
