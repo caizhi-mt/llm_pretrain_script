@@ -2,6 +2,13 @@
 
 import torch
 
+from ..compact_permutation import (
+    compact_permute_with_probs,
+    compact_unpermute,
+    indices_to_routing_map,
+    is_supported as compact_permutation_supported,
+)
+
 from megatron.core.transformer.moe.fused_a2a import (
     get_buffer,
     get_hidden_bytes,
@@ -27,12 +34,20 @@ def _DeepepManager_get_restored_hidden_states_by_experts(self, hidden_states: to
 
         if not HAVE_TE or fused_unpermute is None:
             raise ValueError("fused_unpermute is not available. Please install TE >= 2.1.0.")
-        hidden_states =  fused_unpermute(
-            hidden_states, 
-            self.reversed_mapping_for_combine,
-            restore_shape=self.hidden_shape_before_permute,
-            preallocated_act_f=ace_hidden_states,
-        )
+        if getattr(self, "_musa_compact_permutation_active", False):
+            hidden_states = compact_unpermute(
+                hidden_states,
+                self.reversed_mapping_for_combine,
+                restore_shape=self.hidden_shape_before_permute,
+                preallocated_act_f=ace_hidden_states,
+            )
+        else:
+            hidden_states =  fused_unpermute(
+                hidden_states,
+                self.reversed_mapping_for_combine,
+                restore_shape=self.hidden_shape_before_permute,
+                preallocated_act_f=ace_hidden_states,
+            )
 
         return hidden_states
 
@@ -43,9 +58,23 @@ def _DeepepManager_get_permuted_hidden_states_by_experts(self, hidden_states: to
     ace_hidden_states, ace_probs = deepep_buffer.get_ace_combine_buffer(
         hidden_states.size(0), hidden_states.size(1), self.router_topk, True)
 
-    self.dispatched_routing_map, self.dispatched_probs = fused_indices_to_multihot(
-        self.dispatched_indices, self.dispatched_probs, self.num_local_experts, preallocated_probs_b=ace_probs
+    compact_indices = self.dispatched_indices
+    compact_probs = self.dispatched_probs
+    use_compact_permutation = compact_permutation_supported(
+        hidden_states,
+        compact_indices,
+        compact_probs,
+        self.num_local_experts,
     )
+    if use_compact_permutation:
+        self.dispatched_routing_map = indices_to_routing_map(
+            compact_indices, self.num_local_experts
+        )
+        self.dispatched_probs = compact_probs
+    else:
+        self.dispatched_routing_map, self.dispatched_probs = fused_indices_to_multihot(
+            compact_indices, compact_probs, self.num_local_experts, preallocated_probs_b=ace_probs
+        )
 
     # if self.config.moe_router_padding_for_fp8:
     #     self.dispatched_routing_map, self.tokens_per_expert = self._pad_routing_map(
@@ -55,13 +84,30 @@ def _DeepepManager_get_permuted_hidden_states_by_experts(self, hidden_states: to
     self.hidden_shape_before_permute = hidden_states.shape
     assert self.dispatched_probs.dtype == torch.float32, "DeepEP only supports float32 probs"
 
-    hidden_states, permuted_probs, self.reversed_mapping_for_combine = fused_permute_with_probs(
-        hidden_states,
-        self.dispatched_probs,
-        self.dispatched_routing_map,
-        num_out_tokens=self.tokens_per_expert.sum().item(),
-        preallocated_act_b=ace_hidden_states,
-    )
+    num_out_tokens = self.tokens_per_expert.sum().item()
+    if use_compact_permutation:
+        hidden_states, permuted_probs, self.reversed_mapping_for_combine = (
+            compact_permute_with_probs(
+                hidden_states,
+                compact_probs,
+                compact_indices,
+                self.dispatched_routing_map,
+                num_out_tokens=num_out_tokens,
+                preallocated_act_b=ace_hidden_states,
+                preallocated_probs_b=ace_probs,
+            )
+        )
+    else:
+        hidden_states, permuted_probs, self.reversed_mapping_for_combine = (
+            fused_permute_with_probs(
+                hidden_states,
+                self.dispatched_probs,
+                self.dispatched_routing_map,
+                num_out_tokens=num_out_tokens,
+                preallocated_act_b=ace_hidden_states,
+            )
+        )
+    self._musa_compact_permutation_active = use_compact_permutation
 
     if self.router_dtype == "fp64":
         permuted_probs = permuted_probs.to(torch.float64)
