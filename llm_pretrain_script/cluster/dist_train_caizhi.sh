@@ -32,6 +32,9 @@ export MUSA_FUSED_MLA_DOWN_PROJ=1
 #   注意 triton 不可用时是静默回退，换环境要确认 import triton 成功。
 export MUSA_COMPACT_PERMUTE=1
 
+export MUSA_FUSED_MLA_ROPE=1         # 置 0 仅使用 torch.rope, 不融合 MLA Q/K/V 布局
+                                     #（需 MUSA_NATIVE_ROPE=1 才有意义）
+
 # MATE 提交线程绑核（本机实测拓扑, 不是文档里的 Intel 示例）
 #   AMD EPYC 9T34, 2 socket x 64 core x 2 SMT = 256 逻辑 CPU, NPS1 -> 2 个 NUMA node
 #   node0 = 0-63,128-191   node1 = 64-127,192-238,240-255   (CPU 239 offline)

@@ -268,6 +268,28 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# MUSA_FUSED_MLA_ROPE=1 -> 复用 MLA 的融合 kernel 同时做标准 RoPE 与 Q/K/V 布局装配
+#   省掉显式的 Q/K cat 与 V 拷贝。它把 multi_latent_attention.py 里原本由
+#   config.apply_rope_fusion(本配置为 False)把守的两处门,换成
+#   _can_use_musa_fused_mla_rope() 这个运行期守卫。
+#
+#   ⚠ 以 MUSA_NATIVE_ROPE 为前置:两个开关都为真才走这条路。
+#   守卫另需:两个 fused 符号可导入 / rope_type=='rope' / 非 packed seq / 非推理 /
+#   CP=1 / 非 rotary_interleaved / fp16|bf16 / MUSA tensor,以及
+#   qk_head_dim、qk_pos_emb_head_dim、v_head_dim 【都必须是 2 的幂】
+#   (Triton kernel 用编译期 arange 边界)。我们是 128/64/128,全过。
+#   任一不满足则回退原 eager 路径;但开关本身给了非 0/1 值会直接 raise。
+# ---------------------------------------------------------------------------
+export MUSA_FUSED_MLA_ROPE=${MUSA_FUSED_MLA_ROPE:-1}
+for flag_name in MUSA_NATIVE_ROPE MUSA_FUSED_MLA_ROPE; do
+    flag_value=${!flag_name}
+    if [[ -n "${flag_value}" && "${flag_value}" != "0" && "${flag_value}" != "1" ]]; then
+        echo "Error: ${flag_name} must be 0 or 1, got '${flag_value}'" >&2
+        exit 2
+    fi
+done
+
+# ---------------------------------------------------------------------------
 # MUSA_CPU_AFFINITY=1 -> 按 local rank 绑核
 #   MUSA_CPU_AFFINITY_MAP 用 ';' 分隔,第 i 段是 local rank i 的 CPU 集合,
 #   段内是 ','/'-' 的常规写法(如 0-7,16)。
