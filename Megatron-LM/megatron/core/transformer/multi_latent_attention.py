@@ -522,12 +522,51 @@ class MLASelfAttention(MultiLatentAttention):
         # =========================================
         # QKV down projection and layernorm
         # =========================================
+        # MUSA: fuse the q-lora and kv-lora/rope down projections into one GEMM.
+        # NOTE the import is deliberately NOT inside the `is None` branch (as in the
+        # upstream commit): `from ... import x` binds x as a *function-local* name, so
+        # once the support flag is cached the branch is skipped and x is unbound on the
+        # 2nd call onward -> UnboundLocalError.  Import unconditionally instead.
+        fused_down_projection = getattr(
+            self, "_musa_fused_mla_down_projection_supported", None
+        )
+        fused_mla_down_projection = None
+        if self.config.q_lora_rank is not None:
+            try:
+                from musa_patch.fused_mla_down_projection import (
+                    fused_mla_down_projection,
+                    is_supported as fused_mla_down_projection_is_supported,
+                )
+            except ImportError:
+                fused_down_projection = False
+                self._musa_fused_mla_down_projection_supported = False
+            else:
+                if fused_down_projection is None:
+                    fused_down_projection = fused_mla_down_projection_is_supported(
+                        hidden_states,
+                        self.linear_q_down_proj,
+                        self.linear_kv_down_proj,
+                        self.config,
+                    )
+                    self._musa_fused_mla_down_projection_supported = fused_down_projection
+        else:
+            fused_down_projection = False
+            self._musa_fused_mla_down_projection_supported = False
+
+        if fused_down_projection:
+            q_compressed, kv_combined = fused_mla_down_projection(
+                hidden_states,
+                self.linear_q_down_proj,
+                self.linear_kv_down_proj,
+            )
+
         if self.config.q_lora_rank is not None:
             # if linear_q_down_proj is ColumnParallelLinear:
             #     q_compressed: [s, b, q_lora_rank / TP]
             # elif linear_q_down_proj is Linear:
             #     q_compressed: [s / TP, b, q_lora_rank]
-            q_compressed, _ = self.linear_q_down_proj(hidden_states)
+            if not fused_down_projection:
+                q_compressed, _ = self.linear_q_down_proj(hidden_states)
 
             # When output is sharded (ColumnParallelLinear), two things are needed to be
             # identical to a normal Linear.
@@ -545,7 +584,8 @@ class MLASelfAttention(MultiLatentAttention):
         #     kv_combined: [s, b, (kv_lora_rank + qk_pos_emb_head_dim) / TP]
         # elif linear_kv_down_proj is Linear:
         #     kv_combined: [s / TP, b, (kv_lora_rank + qk_pos_emb_head_dim)]
-        kv_combined, _ = self.linear_kv_down_proj(hidden_states)
+        if not fused_down_projection:
+            kv_combined, _ = self.linear_kv_down_proj(hidden_states)
         if kv_combined.size(-1) != self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim:
             # kv_combined: [s, b, (kv_lora_rank + qk_pos_emb_head_dim)]
             kv_combined = gather_from_tensor_model_parallel_region(kv_combined)

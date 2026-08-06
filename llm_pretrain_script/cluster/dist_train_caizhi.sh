@@ -23,6 +23,10 @@ export LOG_NAME=ws128_$(date +%Y%m%d)   # 每次新 run 换名，避免 cache/ck
 #   得先解决 MCCL 初始化问题。
 export USE_DEEPEP_ACE=1          # 置 0 回退 alltoall dispatcher（当前该路径不可用）
 
+# MLA q/kv 下投影融合（实验35，移植 PR#2 c17e7f0；musa_pretrain_ws128.sh 默认 0）
+#   +0.12%，iter1 gnorm=35.668 已复核。置 0 回退原双 linear 路径。
+export MUSA_FUSED_MLA_DOWN_PROJ=1
+
 # GroupGEMM（对齐 examples 各模型脚本 --moe-grouped-gemm；musa_pretrain_ws128.sh 默认已开）
 # export MOE_GROUPED_GEMM=0        # 置 0 去掉 --moe-grouped-gemm，回退 SequentialMLP（仅排查问题用）
 
