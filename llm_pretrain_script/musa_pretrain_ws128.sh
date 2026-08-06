@@ -268,6 +268,46 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# MATE_FLASH_ATTN=1 -> MLA FlashAttention 前向走 MATE 0.2.5 MUBIN
+#   只替换 TE 引用的 flash_attn_func 的**前向**;backward 仍用原生 MUSA
+#   aten::_scaled_dot_product_attention_flash_musa_backward(不用 MATE varlen bwd)。
+#   适用:Dqk=192(128+64) / Dv=128 / causal / dropout=0 / CP=1 / BF16 / MP31
+#   -> 我们全命中。守卫见 musa_patch/mate_flash_attention.py:_support_reason,
+#   任一不满足则**逐次调用**回退原 flash_attn_func。
+#   硬依赖:mate == mate-mubin == 0.2.5,版本不匹配时保持原生路径(有日志,
+#   不是静默:install 时打印 "validated versions are mate=mate-mubin=0.2.5")。
+#
+#   ⚠ 这是唯一一个明确违反"保持训练精度不变"的移植项。
+#     iter1 grad norm 35.852,基线 35.663 —— 超出 35.66±0.03 判据(相对 0.53%)。
+#     该点权重与数据完全相同,仅算子实现不同,所以这是确定的算子数值差异,
+#     不是随机噪声。loss 最大相对差 9.9e-4(iter10),典型 1e-5~1e-4。
+#     作者报 hidden loss 相对差 0.116%~0.164%,而同配置 run 间自然离散仅 0.025%。
+#     用户已确认"精度可放宽"后才启用;不接受该代价就置 0。
+#
+#   收益:实测 +0.46%(中位 174.5 -> 175.3),推翻了作者的保守结论
+#   (作者在 2 层模型上得 -0.43%,自述"不能宣称端到端收益";我们是 61 层 PP16
+#   生产拓扑)。
+#
+#   注意 musa_patch 里 env_flag 的默认值是 "1",且对非 0/1 值直接 raise;
+#   故此处必须显式导出 0/1,ssh 白名单也必须给默认值,不能传空串。
+# ---------------------------------------------------------------------------
+export MATE_FLASH_ATTN=${MATE_FLASH_ATTN:-0}
+# MUBIN 元数据缓存(mate_flash_attention.py 读取,代码内默认 1)。
+export MATE_CACHE_MUBIN_DISPATCH=${MATE_CACHE_MUBIN_DISPATCH:-1}
+for flag_name in MATE_FLASH_ATTN MATE_CACHE_MUBIN_DISPATCH; do
+    flag_value=${!flag_name}
+    if [[ "${flag_value}" != "0" && "${flag_value}" != "1" ]]; then
+        echo "Error: ${flag_name} must be 0 or 1, got '${flag_value}'" >&2
+        exit 2
+    fi
+done
+if [ "${MATE_FLASH_ATTN}" = "1" ]; then
+    echo "[mate-fa] MLA FA 前向走 MATE MUBIN ENABLED (backward 仍为原生 MUSA)"
+else
+    echo "[mate-fa] disabled"
+fi
+
+# ---------------------------------------------------------------------------
 # MUSA_COMPACT_PERMUTE=1 -> DeepEP local permute/unpermute 用 compact row map
 #   DeepEP 本就返回 [tokens, router_topk];原路径把它摊成
 #   [tokens, local_experts] dense 再喂 TE 的 native MUSA kernel,kernel 要扫全部

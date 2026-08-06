@@ -32,6 +32,12 @@ export MUSA_FUSED_MLA_DOWN_PROJ=1
 #   注意 triton 不可用时是静默回退，换环境要确认 import triton 成功。
 export MUSA_COMPACT_PERMUTE=1
 
+# MATE MLA FlashAttention 前向（实验37，移植 PR#2 a82e08c；musa_pretrain_ws128.sh 默认 0）
+#   +0.46%，但 iter1 grad norm 35.852 超出 35.66±0.03 判据 —— 这是本清单里
+#   唯一有真实精度代价的一项，用户确认"精度可放宽"后才开。不接受就置 0。
+export MATE_FLASH_ATTN=1
+# export MATE_CACHE_MUBIN_DISPATCH=0  # 置 0 禁用 MUBIN 元数据缓存
+
 # GroupGEMM（对齐 examples 各模型脚本 --moe-grouped-gemm；musa_pretrain_ws128.sh 默认已开）
 # export MOE_GROUPED_GEMM=0        # 置 0 去掉 --moe-grouped-gemm，回退 SequentialMLP（仅排查问题用）
 
